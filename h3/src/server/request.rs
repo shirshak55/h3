@@ -3,7 +3,6 @@ use std::{convert::TryFrom, sync::Arc};
 use bytes::Buf;
 use http::{Request, StatusCode};
 
-use tokio::sync::mpsc::UnboundedSender;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -20,7 +19,7 @@ use crate::{
         headers::Header,
     },
     qpack,
-    quic::{self, SendStream, StreamId},
+    quic::{self, SendStream},
     shared_state::{ConnectionState, SharedState},
 };
 
@@ -36,7 +35,8 @@ where
     #[doc(hidden)]
     // TODO: make this private
     pub frame_stream: FrameStream<C::BidiStream, B>,
-    pub(super) request_end_send: UnboundedSender<StreamId>,
+    // Releases the stream ID if dropped before being handed to a `RequestStream`.
+    pub(super) request_end: RequestEnd,
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
     pub(super) shared: Arc<SharedState>,
@@ -142,10 +142,7 @@ where
         };
 
         let request_stream = RequestStream {
-            request_end: Arc::new(RequestEnd {
-                request_end: self.request_end_send.clone(),
-                stream_id: self.frame_stream.send_id(),
-            }),
+            request_end: Arc::new(self.request_end),
             inner: connection::RequestStream::new(
                 self.frame_stream,
                 self.max_field_section_size,

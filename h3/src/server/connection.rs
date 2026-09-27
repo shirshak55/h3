@@ -145,8 +145,11 @@ where
         stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
         RequestResolver {
+            request_end: RequestEnd {
+                request_end: self.request_end_send.clone(),
+                stream_id: stream.send_id(),
+            },
             frame_stream: stream,
-            request_end_send: self.request_end_send.clone(),
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),
