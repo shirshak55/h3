@@ -42,6 +42,7 @@ type BoxStreamSync<'a, T> = Pin<Box<dyn Stream<Item = T> + Sync + Send + 'a>>;
 /// Implements a [`quic::Connection`] backed by a [`quinn::Connection`].
 pub struct Connection {
     conn: quinn::Connection,
+    stopped_hook: Option<StoppedHook>,
     incoming_bi: BoxStreamSync<'static, <AcceptBi<'static> as Future>::Output>,
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
     incoming_uni: BoxStreamSync<'static, <AcceptUni<'static> as Future>::Output>,
@@ -61,9 +62,28 @@ impl Connection {
                 Some((conn.accept_uni().await, conn))
             })),
             opening_uni: None,
+            stopped_hook: None,
+        }
+    }
+
+    /// Like [`Connection::new`], calling `hook` with each accepted bidirectional
+    /// stream's ID and a future resolving when the peer stops reading that stream
+    /// (see [`quinn::SendStream::stopped`]), so a server can cancel the work behind a
+    /// request its client abandoned.
+    pub fn with_stopped_hook(conn: quinn::Connection, hook: StoppedHook) -> Self {
+        Self {
+            stopped_hook: Some(hook),
+            ..Self::new(conn)
         }
     }
 }
+
+/// The future passed to a [`StoppedHook`]: [`quinn::SendStream::stopped`]'s output.
+pub type StoppedFuture =
+    Pin<Box<dyn Future<Output = Result<Option<VarInt>, quinn::StoppedError>> + Send + Sync>>;
+
+/// See [`Connection::with_stopped_hook`].
+pub type StoppedHook = Arc<dyn Fn(quinn::StreamId, StoppedFuture) + Send + Sync>;
 
 impl<B> quic::Connection<B> for Connection
 where
@@ -80,6 +100,9 @@ where
         let (send, recv) = ready!(self.incoming_bi.poll_next_unpin(cx))
             .expect("self.incoming_bi BoxStream never returns None")
             .map_err(|e| convert_connection_error(e))?;
+        if let Some(hook) = &self.stopped_hook {
+            hook(send.id(), Box::pin(send.stopped()));
+        }
         Poll::Ready(Ok(Self::BidiStream {
             send: Self::SendStream::new(send),
             recv: Self::RecvStream::new(recv),
