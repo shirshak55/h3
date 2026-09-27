@@ -1,7 +1,7 @@
 use std::{convert::TryFrom, sync::Arc};
 
 use bytes::Buf;
-use http::{Request, StatusCode};
+use http::{HeaderName, Request, StatusCode};
 
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -212,6 +212,13 @@ where
             }
         };
 
+        // Pseudo-header names (`:method`, …) aren't header names, so this lists the
+        // regular fields.
+        let order = fields
+            .iter()
+            .filter_map(|field| HeaderName::from_bytes(&field.name).ok())
+            .collect();
+
         // Parse the request headers
         let result = match Header::try_from(fields) {
             Ok(header) => match header.into_request_parts() {
@@ -247,6 +254,7 @@ where
         if let Some(protocol) = protocol {
             req.extensions_mut().insert(protocol);
         }
+        req.extensions_mut().insert(crate::ext::HeaderOrder(order));
         *req.version_mut() = http::Version::HTTP_3;
         #[cfg(feature = "tracing")]
         tracing::trace!("replying with: {:?}", req);

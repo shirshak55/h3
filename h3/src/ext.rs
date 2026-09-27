@@ -2,6 +2,8 @@
 
 use std::str::FromStr;
 
+use http::HeaderName;
+
 /// Describes the `:protocol` pseudo-header for extended connect
 ///
 /// See: <https://www.rfc-editor.org/rfc/rfc8441#section-4>
@@ -44,3 +46,10 @@ impl FromStr for Protocol {
         }
     }
 }
+
+/// The names of a request's header fields in the order its field section carries them,
+/// repeats included, which a `HeaderMap` loses by grouping a repeated name's values.
+///
+/// The server inserts one into each request it receives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderOrder(pub Vec<HeaderName>);
