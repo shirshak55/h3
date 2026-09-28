@@ -156,6 +156,24 @@ where
         }
     }
 
+    /// The peer's SETTINGS as received: every (identifier, value) pair in wire order, unknown
+    /// and reserved (GREASE) identifiers included. `None` until the SETTINGS frame is read.
+    pub fn peer_settings_raw(&self) -> Option<&[(u64, u64)]> {
+        self.inner.peer_settings_raw()
+    }
+
+    /// The (stream ID, stream type) of the first 16 unidirectional streams the peer opened, in
+    /// the order their types were read, reserved (GREASE) types included.
+    pub fn peer_uni_streams(&self) -> &[(StreamId, u64)] {
+        self.inner.peer_uni_streams()
+    }
+
+    /// The types of the first 16 frames on the peer's control stream, in wire order, unknown and
+    /// reserved (GREASE) types included.
+    pub fn peer_control_frame_types(&self) -> &[u64] {
+        self.inner.peer_control_frame_types()
+    }
+
     /// Initiate a graceful shutdown, accepting `max_request` potentially still in-flight
     ///
     /// See [connection shutdown](https://www.rfc-editor.org/rfc/rfc9114.html#connection-shutdown) for more information.

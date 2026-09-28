@@ -221,13 +221,16 @@ where
 
         // Parse the request headers
         let result = match Header::try_from(fields) {
-            Ok(header) => match header.into_request_parts() {
-                Ok(parts) => Ok(parts),
-                Err(err) => Err(err),
-            },
+            Ok(header) => {
+                let pseudo_order = header.pseudo_order().clone();
+                match header.into_request_parts() {
+                    Ok(parts) => Ok((parts, pseudo_order)),
+                    Err(err) => Err(err),
+                }
+            }
             Err(err) => Err(err),
         };
-        let (method, uri, protocol, headers) = match result {
+        let ((method, uri, protocol, headers), pseudo_order) = match result {
             Ok(parts) => parts,
             Err(err) => {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
@@ -255,6 +258,7 @@ where
             req.extensions_mut().insert(protocol);
         }
         req.extensions_mut().insert(crate::ext::HeaderOrder(order));
+        req.extensions_mut().insert(pseudo_order);
         *req.version_mut() = http::Version::HTTP_3;
         #[cfg(feature = "tracing")]
         tracing::trace!("replying with: {:?}", req);

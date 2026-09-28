@@ -285,6 +285,11 @@ where
         }
     }
 
+    pub fn id_and_type(&self) -> (quic::StreamId, u64) {
+        let ty = self.ty.as_ref().expect("Stream type not resolved yet");
+        (self.stream.recv_id(), ty.value())
+    }
+
     pub fn into_stream(self) -> AcceptedRecvStream<S, B> {
         match self.ty.expect("Stream type not resolved yet") {
             StreamType::CONTROL => AcceptedRecvStream::Control(FrameStream::new(self.stream)),

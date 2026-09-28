@@ -15,6 +15,7 @@ use crate::{
     proto::{
         frame::{self, Frame, PayloadLen},
         stream::StreamId,
+        varint::BufExt as _,
     },
     quic::{BidiStream, RecvStream, SendStream},
 };
@@ -40,6 +41,15 @@ impl<S, B> FrameStream<S, B> {
     /// partially received/read frames.
     pub fn into_inner(self) -> BufRecvStream<S, B> {
         self.stream
+    }
+
+    /// Records the types of the first `limit` frames read, unknown ones included.
+    pub fn record_frame_types(&mut self, limit: usize) {
+        self.decoder.record_limit = limit;
+    }
+
+    pub fn frame_types(&self) -> &[u64] {
+        &self.decoder.frame_types
     }
 }
 
@@ -205,6 +215,8 @@ where
 #[derive(Default)]
 pub struct FrameDecoder {
     expected: Option<usize>,
+    record_limit: usize,
+    frame_types: Vec<u64>,
 }
 
 impl FrameDecoder {
@@ -230,6 +242,13 @@ impl FrameDecoder {
                 let decoded = Frame::decode(&mut cur);
                 (cur.position(), decoded)
             };
+
+            if self.frame_types.len() < self.record_limit
+                && matches!(decoded, Ok(_) | Err(frame::FrameError::UnknownFrame(_)))
+            {
+                let ty = src.cursor().get_var().expect("a decoded frame has a type");
+                self.frame_types.push(ty);
+            }
 
             match decoded {
                 Err(frame::FrameError::UnknownFrame(_ty)) => {

@@ -31,11 +31,14 @@ use crate::{
         varint::VarInt,
     },
     qpack,
-    quic::{self, RecvStream, SendStream, StreamErrorIncoming},
+    quic::{self, RecvStream, SendStream, StreamErrorIncoming, StreamId},
     shared_state::{ConnectionState, SharedState},
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, UniStreamHeader},
     webtransport::SessionId,
 };
+
+/// How many of the peer's unidirectional streams and control frames are recorded.
+const PEER_RECORD_LIMIT: usize = 16;
 
 #[allow(missing_docs)]
 pub struct AcceptedStreams<C, B>
@@ -104,6 +107,8 @@ where
     accepted_streams: AcceptedStreams<C, B>,
     pending_recv_streams: Vec<Option<AcceptRecvStream<C::RecvStream, B>>>,
     got_peer_settings: bool,
+    peer_settings: Option<Vec<(u64, u64)>>,
+    peer_uni_streams: Vec<(StreamId, u64)>,
     pub(crate) handled_connection_error: Option<ConnectionError>,
     pub send_grease_frame: bool,
     // tells if the grease steam should be sent
@@ -311,6 +316,8 @@ where
             handled_connection_error: None,
             pending_recv_streams: Vec::with_capacity(3),
             got_peer_settings: false,
+            peer_settings: None,
+            peer_uni_streams: Vec::new(),
             send_grease_frame: config.send_grease,
             config,
             accepted_streams: Default::default(),
@@ -435,18 +442,23 @@ where
                 Poll::Pending => continue,
             };
 
+            if self.peer_uni_streams.len() < PEER_RECORD_LIMIT {
+                self.peer_uni_streams.push(resolved.id_and_type());
+            }
+
             match resolved.into_stream() {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
                 //# Only one control stream per peer is permitted;
                 //# receipt of a second stream claiming to be a control stream MUST be
                 //# treated as a connection error of type H3_STREAM_CREATION_ERROR.
-                AcceptedRecvStream::Control(s) => {
+                AcceptedRecvStream::Control(mut s) => {
                     if self.control_recv.is_some() {
                         return Err(self.handle_connection_error(InternalConnectionError::new(
                             Code::H3_STREAM_CREATION_ERROR,
                             "got two control streams".to_string(),
                         )));
                     }
+                    s.record_frame_types(PEER_RECORD_LIMIT);
                     self.control_recv = Some(s);
                 }
                 enc @ AcceptedRecvStream::Encoder(_) => {
@@ -589,6 +601,7 @@ where
                     // Received settings frame
 
                     self.got_peer_settings = true;
+                    self.peer_settings = Some(settings.iter().collect());
                     self.set_settings((&settings).into());
 
                     Frame::Settings(settings)
@@ -808,6 +821,23 @@ where
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn accepted_streams_mut(&mut self) -> &mut AcceptedStreams<C, B> {
         &mut self.accepted_streams
+    }
+
+    /// The peer's SETTINGS as received, every (identifier, value) pair in wire order.
+    pub fn peer_settings_raw(&self) -> Option<&[(u64, u64)]> {
+        self.peer_settings.as_deref()
+    }
+
+    /// The first unidirectional streams the peer opened, as (stream ID, stream type).
+    pub fn peer_uni_streams(&self) -> &[(StreamId, u64)] {
+        &self.peer_uni_streams
+    }
+
+    /// The types of the first frames on the peer's control stream, in wire order.
+    pub fn peer_control_frame_types(&self) -> &[u64] {
+        self.control_recv
+            .as_ref()
+            .map_or(&[], |control| control.frame_types())
     }
 }
 

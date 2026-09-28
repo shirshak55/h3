@@ -13,7 +13,7 @@ use http::{
 };
 
 use crate::{
-    ext::{HeaderOrder, Protocol},
+    ext::{HeaderOrder, Protocol, PseudoOrder},
     qpack::HeaderField,
 };
 
@@ -24,6 +24,8 @@ pub struct Header {
     fields: HeaderMap,
     /// The fields' names in the order to encode them in
     order: HeaderOrder,
+    /// The pseudo-header fields' names in the order received or to encode them in
+    pseudo_order: PseudoOrder,
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -42,6 +44,7 @@ impl Header {
                 pseudo: Pseudo::request(method, uri, ext),
                 fields,
                 order: HeaderOrder::default(),
+                pseudo_order: PseudoOrder::default(),
             }),
         }
     }
@@ -51,6 +54,7 @@ impl Header {
             pseudo: Pseudo::response(status),
             fields,
             order: HeaderOrder::default(),
+            pseudo_order: PseudoOrder::default(),
         }
     }
 
@@ -62,12 +66,23 @@ impl Header {
             pseudo: Pseudo::default(),
             fields,
             order: HeaderOrder::default(),
+            pseudo_order: PseudoOrder::default(),
         }
     }
 
     /// Encodes the fields in `order`.
     pub fn set_order(&mut self, order: HeaderOrder) {
         self.order = order;
+    }
+
+    /// Encodes the pseudo-header fields in `order`.
+    pub fn set_pseudo_order(&mut self, order: PseudoOrder) {
+        self.pseudo_order = order;
+    }
+
+    /// The order the pseudo-header fields were decoded in.
+    pub fn pseudo_order(&self) -> &PseudoOrder {
+        &self.pseudo_order
     }
 
     pub fn into_request_parts(
@@ -162,6 +177,7 @@ impl IntoIterator for Header {
             (HeaderMap::new(), ordered)
         };
         HeaderIter {
+            pseudo_order: self.pseudo_order.0.into_iter(),
             pseudo: Some(self.pseudo),
             last_header_name: None,
             fields: fields.into_iter(),
@@ -196,6 +212,7 @@ fn ordered_fields(fields: &HeaderMap, order: &[HeaderName]) -> Vec<(HeaderName, 
 }
 
 pub struct HeaderIter {
+    pseudo_order: std::vec::IntoIter<&'static str>,
     pseudo: Option<Pseudo>,
     last_header_name: Option<HeaderName>,
     fields: header::IntoIter<HeaderValue>,
@@ -210,6 +227,32 @@ impl Iterator for HeaderIter {
         //# All pseudo-header fields MUST appear in the header section before
         //# regular header fields.
         if let Some(ref mut pseudo) = self.pseudo {
+            for name in self.pseudo_order.by_ref() {
+                let field = match name {
+                    ":method" => pseudo.method.take().map(|m| (name, m.as_str()).into()),
+                    ":scheme" => pseudo
+                        .scheme
+                        .take()
+                        .map(|s| (name, s.as_str().as_bytes()).into()),
+                    ":authority" => pseudo
+                        .authority
+                        .take()
+                        .map(|a| (name, a.as_str().as_bytes()).into()),
+                    ":path" => pseudo
+                        .path
+                        .take()
+                        .map(|p| (name, p.as_str().as_bytes()).into()),
+                    ":protocol" => pseudo
+                        .protocol
+                        .take()
+                        .map(|p| (name, p.as_str().as_bytes()).into()),
+                    _ => None,
+                };
+                if field.is_some() {
+                    return field;
+                }
+            }
+
             if let Some(method) = pseudo.method.take() {
                 return Some((":method", method.as_str()).into());
             }
@@ -257,23 +300,28 @@ impl TryFrom<Vec<HeaderField>> for Header {
     fn try_from(headers: Vec<HeaderField>) -> Result<Self, Self::Error> {
         let mut fields = HeaderMap::with_capacity(headers.len());
         let mut pseudo = Pseudo::default();
+        let mut pseudo_order = Vec::new();
 
         for field in headers.into_iter() {
             let (name, value) = field.into_inner();
             match Field::parse(name, value)? {
                 Field::Method(m) => {
+                    pseudo_order.push(":method");
                     pseudo.method = Some(m);
                     pseudo.len += 1;
                 }
                 Field::Scheme(s) => {
+                    pseudo_order.push(":scheme");
                     pseudo.scheme = Some(s);
                     pseudo.len += 1;
                 }
                 Field::Authority(a) => {
+                    pseudo_order.push(":authority");
                     pseudo.authority = Some(a);
                     pseudo.len += 1;
                 }
                 Field::Path(p) => {
+                    pseudo_order.push(":path");
                     pseudo.path = Some(p);
                     pseudo.len += 1;
                 }
@@ -285,6 +333,7 @@ impl TryFrom<Vec<HeaderField>> for Header {
                     fields.append(n, v);
                 }
                 Field::Protocol(p) => {
+                    pseudo_order.push(":protocol");
                     pseudo.protocol = Some(p);
                     pseudo.len += 1;
                 }
@@ -295,6 +344,7 @@ impl TryFrom<Vec<HeaderField>> for Header {
             pseudo,
             fields,
             order: HeaderOrder::default(),
+            pseudo_order: PseudoOrder(pseudo_order),
         })
     }
 }

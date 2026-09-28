@@ -60,3 +60,10 @@ impl FromStr for Protocol {
 /// [`RequestStream::send_trailers_with_order`]: crate::server::RequestStream::send_trailers_with_order
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeaderOrder(pub Vec<HeaderName>);
+
+/// The order of a request's pseudo-header fields (`:method`, `:scheme`, `:authority`,
+/// `:path`, `:protocol`): the order a server received them in, as a request extension,
+/// or the order a client sends them in, when its request carries one. Those it doesn't
+/// list follow in the default order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PseudoOrder(pub Vec<&'static str>);

@@ -389,8 +389,6 @@ fn simple_frame_encode<B: BufMut>(ty: FrameType, id: VarInt, buf: &mut B) {
 pub struct SettingId(pub u64);
 
 impl SettingId {
-    const NONE: SettingId = SettingId(0);
-
     /// returns a SettingId type with random number of the 0x1f * N + 0x21
     /// format within the range of the Varint implementation
     pub fn grease() -> Self {
@@ -457,64 +455,58 @@ setting_identifiers! {
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
 }
 
-const SETTINGS_LEN: usize = 8;
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Settings {
-    entries: [(SettingId, u64); SETTINGS_LEN],
-    len: usize,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            entries: [(SettingId::NONE, 0); SETTINGS_LEN],
-            len: 0,
-        }
-    }
+    entries: Vec<(SettingId, u64)>,
 }
 
 impl FrameHeader for Settings {
     const TYPE: FrameType = FrameType::SETTINGS;
     fn len(&self) -> usize {
-        self.entries[..self.len].iter().fold(0, |len, (id, val)| {
+        self.entries.iter().fold(0, |len, (id, val)| {
             len + VarInt::from_u64(id.0).unwrap().size() + VarInt::from_u64(*val).unwrap().size()
         })
     }
 }
 
-impl Settings {
-    pub const MAX_ENCODED_SIZE: usize = SETTINGS_LEN * 2 * VarInt::MAX_SIZE;
-
-    pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
-        if self.len >= self.entries.len() {
-            return Err(SettingsError::Exceeded);
+impl FromIterator<(u64, u64)> for Settings {
+    fn from_iter<I: IntoIterator<Item = (u64, u64)>>(entries: I) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|(id, value)| (SettingId(id), value))
+                .collect(),
         }
+    }
+}
 
+impl Settings {
+    pub fn insert(&mut self, id: SettingId, value: u64) -> Result<(), SettingsError> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
         //# The same setting identifier MUST NOT occur more than once in the
         //# SETTINGS frame.
-        if self.entries[..self.len].iter().any(|(i, _)| *i == id) {
+        if self.get(id).is_some() {
             return Err(SettingsError::Repeated(id));
         }
 
-        self.entries[self.len] = (id, value);
-        self.len += 1;
+        self.entries.push((id, value));
         Ok(())
     }
 
     pub fn get(&self, id: SettingId) -> Option<u64> {
-        for (entry_id, value) in self.entries.iter() {
-            if id == *entry_id {
-                return Some(*value);
-            }
-        }
-        None
+        self.entries
+            .iter()
+            .find(|(entry_id, _)| *entry_id == id)
+            .map(|(_, value)| *value)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.entries.iter().map(|(id, value)| (id.0, *value))
     }
 
     pub(crate) fn encode<T: BufMut>(&self, buf: &mut T) {
         self.encode_header(buf);
-        for (id, val) in self.entries[..self.len].iter() {
+        for (id, val) in self.entries.iter() {
             id.encode(buf);
             buf.write_var(*val);
         }
@@ -555,6 +547,7 @@ impl Settings {
                 //# any meaning upon receipt.
                 #[cfg(feature = "tracing")]
                 tracing::debug!("Unsupported setting: {:#x?}", identifier);
+                settings.entries.push((identifier, value));
             }
         }
         Ok(settings)
@@ -563,7 +556,6 @@ impl Settings {
 
 #[derive(Debug, PartialEq)]
 pub enum SettingsError {
-    Exceeded,
     Malformed,
     Repeated(SettingId),
     InvalidSettingId(u64),
@@ -575,10 +567,6 @@ impl std::error::Error for SettingsError {}
 impl fmt::Display for SettingsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SettingsError::Exceeded => write!(
-                f,
-                "max settings number exceeded, check for duplicate entries"
-            ),
             SettingsError::Malformed => write!(f, "malformed settings frame"),
             SettingsError::Repeated(id) => write!(f, "got setting 0x{:x} twice", id.0),
             SettingsError::InvalidSettingId(id) => write!(f, "setting id 0x{:x} is invalid", id),
@@ -661,34 +649,24 @@ mod tests {
     fn settings_frame() {
         codec_frame_check(
             Frame::Settings(Settings {
-                entries: [
+                entries: vec![
                     (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
                     (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
                     (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
                     (SettingId(95), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
                 ],
-                len: 4,
             }),
             &[
                 4, 18, 6, 128, 0, 250, 209, 1, 128, 0, 250, 210, 7, 128, 0, 250, 211, 64, 95, 0,
             ],
             Frame::Settings(Settings {
-                entries: [
+                entries: vec![
                     (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
                     (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
                     (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    // check without the Grease setting because this is ignored
-                    (SettingId(0), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
+                    // the unknown setting is kept, in wire order
+                    (SettingId(95), 0),
                 ],
-                len: 3,
             }),
         );
     }
