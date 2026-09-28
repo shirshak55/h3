@@ -47,6 +47,7 @@ pub struct Connection {
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
     incoming_uni: BoxStreamSync<'static, <AcceptUni<'static> as Future>::Output>,
     opening_uni: Option<BoxStreamSync<'static, <OpenUni<'static> as Future>::Output>>,
+    replayed_uni: std::collections::VecDeque<RecvStream>,
 }
 
 impl Connection {
@@ -63,6 +64,26 @@ impl Connection {
             })),
             opening_uni: None,
             stopped_hook: None,
+            replayed_uni: Default::default(),
+        }
+    }
+
+    /// Like [`Connection::new`] for a connection whose unidirectional streams `streams` the
+    /// caller accepted and began reading: they are accepted first, in this order, each
+    /// reading the bytes the caller read from it before the rest.
+    pub fn with_accepted_uni(
+        conn: quinn::Connection,
+        streams: impl IntoIterator<Item = (quinn::RecvStream, Bytes)>,
+    ) -> Self {
+        Self {
+            replayed_uni: streams
+                .into_iter()
+                .map(|(stream, read)| RecvStream {
+                    read: (!read.is_empty()).then_some(read),
+                    ..RecvStream::new(stream)
+                })
+                .collect(),
+            ..Self::new(conn)
         }
     }
 
@@ -114,6 +135,9 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
+        if let Some(recv) = self.replayed_uni.pop_front() {
+            return Poll::Ready(Ok(recv));
+        }
         let recv = ready!(self.incoming_uni.poll_next_unpin(cx))
             .expect("self.incoming_uni BoxStream never returns None")
             .map_err(|e| convert_connection_error(e))?;
@@ -368,6 +392,8 @@ where
 pub struct RecvStream {
     stream: Option<quinn::RecvStream>,
     read_chunk_fut: ReadChunkFuture,
+    /// Bytes read before this stream was handed over, returned first.
+    read: Option<Bytes>,
 }
 
 type ReadChunkFuture = ReusableBoxFuture<
@@ -384,6 +410,7 @@ impl RecvStream {
             stream: Some(stream),
             // Should only allocate once the first time it's used
             read_chunk_fut: ReusableBoxFuture::new(async { unreachable!() }),
+            read: None,
         }
     }
 }
@@ -396,6 +423,9 @@ impl quic::RecvStream for RecvStream {
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+        if let Some(read) = self.read.take() {
+            return Poll::Ready(Ok(Some(read)));
+        }
         if let Some(mut stream) = self.stream.take() {
             self.read_chunk_fut.set(async move {
                 let chunk = stream.read_chunk(usize::MAX, true).await;

@@ -86,6 +86,24 @@ impl Builder {
         self
     }
 
+    /// Send these (identifier, value) pairs, in this order, as the SETTINGS frame instead of
+    /// the generated ones, honouring what they carry as
+    /// [`crate::client::Builder::raw_settings`] does.
+    pub fn raw_settings(&mut self, settings: impl IntoIterator<Item = (u64, u64)>) -> &mut Self {
+        self.config.raw_settings = Some(settings.into_iter().collect());
+        self
+    }
+
+    /// Send these frames on the control stream after SETTINGS, in this order, as
+    /// [`crate::client::Builder::control_frames`] does.
+    pub fn control_frames(
+        &mut self,
+        frames: impl IntoIterator<Item = crate::ext::ControlFrame>,
+    ) -> &mut Self {
+        self.config.control_frames = frames.into_iter().collect();
+        self
+    }
+
     /// Advertise SETTINGS_QPACK_MAX_TABLE_CAPACITY: above 0, field sections are decoded with a
     /// QPACK dynamic table of up to this many bytes, built from the peer's encoder stream, and
     /// acknowledged on the decoder stream. 0 (the default) decodes without one, as before.
@@ -184,10 +202,15 @@ impl Builder {
     {
         let (sender, receiver) = mpsc::unbounded_channel();
         let shared = SharedState::default();
+        let mut config = self.config.clone();
+        if let Some(raw) = &config.raw_settings {
+            config.settings = raw.into();
+        }
+        let max_field_section_size = config.settings.max_field_section_size;
 
         Ok(Connection {
-            inner: ConnectionInner::new(conn, Arc::new(shared), self.config.clone()).await?,
-            max_field_section_size: self.config.settings.max_field_section_size,
+            inner: ConnectionInner::new(conn, Arc::new(shared), config).await?,
+            max_field_section_size,
             request_end_send: sender,
             request_end_recv: receiver,
             ongoing_streams: HashSet::new(),
