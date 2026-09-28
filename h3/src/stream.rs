@@ -40,6 +40,29 @@ where
     Ok(())
 }
 
+/// Transmits data already in wire format, in pieces that fit a [`WriteBuf`].
+pub(crate) async fn write_encoded<S, B>(
+    stream: &mut S,
+    data: &[u8],
+) -> Result<(), StreamErrorIncoming>
+where
+    S: SendStream<B>,
+    B: Buf,
+{
+    for chunk in data.chunks(WRITE_BUF_ENCODE_SIZE) {
+        let mut buf = WriteBuf {
+            buf: [0; WRITE_BUF_ENCODE_SIZE],
+            len: chunk.len(),
+            pos: 0,
+            frame: None,
+        };
+        buf.buf[..chunk.len()].copy_from_slice(chunk);
+        write(stream, buf).await?;
+    }
+
+    Ok(())
+}
+
 const WRITE_BUF_ENCODE_SIZE: usize = StreamType::MAX_ENCODED_SIZE + Frame::MAX_ENCODED_SIZE;
 
 /// Wrap frames to encode their header on the stack before sending them on the wire

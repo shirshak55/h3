@@ -94,6 +94,37 @@ impl Builder {
     /// and accommodate future changes without breaking existing implementations.
     pub fn send_grease(&mut self, enabled: bool) -> &mut Self {
         self.config.send_grease = enabled;
+        self.config.send_grease_frame = enabled;
+        self.config.send_grease_stream = enabled;
+        self
+    }
+
+    /// Send a reserved frame on the first request stream
+    pub fn send_grease_frame(&mut self, enabled: bool) -> &mut Self {
+        self.config.send_grease_frame = enabled;
+        self
+    }
+
+    /// Open a unidirectional stream of a reserved type carrying a reserved frame
+    pub fn send_grease_stream(&mut self, enabled: bool) -> &mut Self {
+        self.config.send_grease_stream = enabled;
+        self
+    }
+
+    /// Send a reserved frame on the control stream right after the SETTINGS frame
+    pub fn send_control_grease_frame(&mut self, enabled: bool) -> &mut Self {
+        self.config.send_control_grease_frame = enabled;
+        self
+    }
+
+    /// Send these (identifier, value) pairs, in this order, as the SETTINGS frame instead of
+    /// the generated ones.
+    ///
+    /// The client then enforces and reports the MAX_FIELD_SECTION_SIZE, extended CONNECT,
+    /// datagram and WebTransport values they carry, overriding the other builder settings.
+    /// QPACK settings are sent as given, but the client keeps decoding without a dynamic table.
+    pub fn raw_settings(&mut self, settings: impl IntoIterator<Item = (u64, u64)>) -> &mut Self {
+        self.config.raw_settings = Some(settings.into_iter().collect());
         self
     }
 
@@ -126,13 +157,18 @@ impl Builder {
 
         let conn_state = Arc::new(shared);
 
-        let inner = ConnectionInner::new(quic, conn_state.clone(), self.config).await?;
+        let mut config = self.config.clone();
+        if let Some(raw) = &config.raw_settings {
+            config.settings = raw.into();
+        }
+
+        let inner = ConnectionInner::new(quic, conn_state.clone(), config).await?;
         let send_request = SendRequest {
             open,
             conn_state,
-            max_field_section_size: self.config.settings.max_field_section_size,
+            max_field_section_size: inner.config.settings.max_field_section_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
-            send_grease_frame: self.config.send_grease,
+            send_grease_frame: inner.config.send_grease_frame,
             _buf: PhantomData,
         };
 

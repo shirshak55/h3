@@ -3,7 +3,7 @@ use std::convert::TryFrom;
 use crate::proto::{frame, varint::VarInt};
 
 /// Configures the HTTP/3 connection
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Config {
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
@@ -11,6 +11,11 @@ pub struct Config {
     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
     /// and accommodate future changes without breaking existing implementations.
     pub(crate) send_grease: bool,
+    pub(crate) send_grease_frame: bool,
+    pub(crate) send_grease_stream: bool,
+    pub(crate) send_control_grease_frame: bool,
+    /// SETTINGS sent verbatim instead of the ones generated from `settings`
+    pub(crate) raw_settings: Option<frame::Settings>,
 
     #[cfg(test)]
     pub(crate) send_settings: bool,
@@ -76,6 +81,10 @@ impl TryFrom<Config> for frame::Settings {
 
         let Config {
             send_grease,
+            send_grease_frame: _,
+            send_grease_stream: _,
+            send_control_grease_frame: _,
+            raw_settings,
             #[cfg(test)]
                 send_settings: _,
             settings:
@@ -87,6 +96,19 @@ impl TryFrom<Config> for frame::Settings {
                     max_webtransport_sessions,
                 },
         } = value;
+
+        if let Some(raw) = raw_settings {
+            if let Some((id, value)) = raw
+                .iter()
+                .find(|&(id, value)| VarInt::from_u64(id).and(VarInt::from_u64(value)).is_err())
+            {
+                return Err(frame::SettingsError::InvalidSettingValue(
+                    frame::SettingId(id),
+                    value,
+                ));
+            }
+            return Ok(raw);
+        }
 
         if send_grease {
             //  Grease Settings (https://www.rfc-editor.org/rfc/rfc9114.html#name-defined-settings-parameters)
@@ -171,6 +193,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             send_grease: true,
+            send_grease_frame: true,
+            send_grease_stream: true,
+            send_control_grease_frame: false,
+            raw_settings: None,
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),

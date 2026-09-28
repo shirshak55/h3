@@ -160,12 +160,20 @@ where
             extensions,
             ..
         } = parts;
-        let headers = Header::request(method, uri, headers, extensions).map_err(|_e| {
+        let order = extensions.get::<crate::ext::HeaderOrder>().cloned();
+        let pseudo_order = extensions.get::<crate::ext::PseudoOrder>().cloned();
+        let mut headers = Header::request(method, uri, headers, extensions).map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
                 code: Code::H3_INTERNAL_ERROR,
                 message: "Failed to build request headers".to_string(),
             })
         })?;
+        if let Some(order) = order {
+            headers.set_order(order);
+        }
+        if let Some(pseudo_order) = pseudo_order {
+            headers.set_pseudo_order(pseudo_order);
+        }
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
         //= type=implication

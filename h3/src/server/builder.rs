@@ -81,6 +81,8 @@ impl Builder {
     #[inline]
     pub fn send_grease(&mut self, value: bool) -> &mut Self {
         self.config.send_grease = value;
+        self.config.send_grease_frame = value;
+        self.config.send_grease_stream = value;
         self
     }
 
@@ -132,7 +134,7 @@ impl Builder {
         let shared = SharedState::default();
 
         Ok(Connection {
-            inner: ConnectionInner::new(conn, Arc::new(shared), self.config).await?,
+            inner: ConnectionInner::new(conn, Arc::new(shared), self.config.clone()).await?,
             max_field_section_size: self.config.settings.max_field_section_size,
             request_end_send: sender,
             request_end_recv: receiver,

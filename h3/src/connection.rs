@@ -25,6 +25,7 @@ use crate::{
     ext::HeaderOrder,
     frame::{FrameStream, FrameStreamError},
     proto::{
+        coding::Encode,
         frame::{self, Frame, PayloadLen},
         headers::Header,
         stream::StreamType,
@@ -158,7 +159,7 @@ where
             return Ok(());
         }
 
-        let settings = frame::Settings::try_from(self.config).map_err(|_err| {
+        let settings = frame::Settings::try_from(self.config.clone()).map_err(|_err| {
             // TODO: converting a config to settings should never fail
             //       it should be impossible to construct a config which cannot be represented as settings
             self.handle_connection_error(InternalConnectionError::new(
@@ -196,14 +197,17 @@ where
         //# the peer prior to sending the SETTINGS frame; settings MUST be sent
         //# as soon as the transport is ready to send data.
 
+        let mut control_header = Vec::new();
+        UniStreamHeader::Control(settings).encode(&mut control_header);
+        if self.config.send_control_grease_frame {
+            Frame::<B>::Grease.encode(&mut control_header);
+        }
+
         let mut decoder_send = Option::take(&mut self.qpack_streams.decoder_send);
         let mut encoder_send = Option::take(&mut self.qpack_streams.encoder_send);
 
         let (control, ..) = future::join3(
-            stream::write(
-                &mut self.control_send,
-                WriteBuf::from(UniStreamHeader::Control(settings)),
-            ),
+            stream::write_encoded(&mut self.control_send, &control_header),
             async {
                 if let Some(stream) = &mut decoder_send {
                     let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Decoder)).await;
@@ -318,11 +322,11 @@ where
             got_peer_settings: false,
             peer_settings: None,
             peer_uni_streams: Vec::new(),
-            send_grease_frame: config.send_grease,
+            send_grease_frame: config.send_grease_frame,
+            // send grease stream if configured
+            send_grease_stream_flag: config.send_grease_stream,
             config,
             accepted_streams: Default::default(),
-            // send grease stream if configured
-            send_grease_stream_flag: config.send_grease,
             // start at first step
             grease_step: GreaseStatus::NotStarted(PhantomData),
         };
