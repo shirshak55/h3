@@ -18,6 +18,10 @@ pub struct Config {
     pub(crate) raw_settings: Option<frame::Settings>,
     /// The largest QPACK dynamic table capacity the encoder sets; 0 encodes statelessly
     pub(crate) qpack_encoder_capacity: u64,
+    /// Open the QPACK decoder stream before the encoder stream
+    pub(crate) qpack_decoder_stream_first: bool,
+    /// Write each QPACK stream's type only with its first instruction
+    pub(crate) qpack_lazy_stream_types: bool,
 
     #[cfg(test)]
     pub(crate) send_settings: bool,
@@ -98,6 +102,8 @@ impl TryFrom<Config> for frame::Settings {
             send_control_grease_frame: _,
             raw_settings,
             qpack_encoder_capacity: _,
+            qpack_decoder_stream_first: _,
+            qpack_lazy_stream_types: _,
             #[cfg(test)]
                 send_settings: _,
             settings:
@@ -227,6 +233,8 @@ impl Default for Config {
             send_control_grease_frame: false,
             raw_settings: None,
             qpack_encoder_capacity: 0,
+            qpack_decoder_stream_first: false,
+            qpack_lazy_stream_types: false,
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),

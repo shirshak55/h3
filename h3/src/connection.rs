@@ -118,6 +118,9 @@ where
     qpack_encoding: bool,
     /// Encoder-stream instructions being written
     encoder_queue: Queued,
+    /// The QPACK streams' types were written
+    decoder_typed: bool,
+    encoder_typed: bool,
     pub(crate) handled_connection_error: Option<ConnectionError>,
     pub send_grease_frame: bool,
     // tells if the grease steam should be sent
@@ -213,16 +216,17 @@ where
 
         let mut decoder_send = Option::take(&mut self.qpack_streams.decoder_send);
         let mut encoder_send = Option::take(&mut self.qpack_streams.encoder_send);
+        let lazy = self.config.qpack_lazy_stream_types;
 
         let (control, ..) = future::join3(
             stream::write_encoded(&mut self.control_send, &control_header),
             async {
-                if let Some(stream) = &mut decoder_send {
+                if let Some(stream) = decoder_send.as_mut().filter(|_| !lazy) {
                     let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Decoder)).await;
                 }
             },
             async {
-                if let Some(stream) = &mut encoder_send {
+                if let Some(stream) = encoder_send.as_mut().filter(|_| !lazy) {
                     let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Encoder)).await;
                 }
             },
@@ -271,11 +275,16 @@ where
         //# QPACK encoder and decoder streams) first, and then create additional
 
         // start streams
-        let (control_send, qpack_encoder, qpack_decoder) = (
-            future::poll_fn(|cx| conn.poll_open_send(cx)).await,
-            future::poll_fn(|cx| conn.poll_open_send(cx)).await,
-            future::poll_fn(|cx| conn.poll_open_send(cx)).await,
-        );
+        let control_send = future::poll_fn(|cx| conn.poll_open_send(cx)).await;
+        let (qpack_encoder, qpack_decoder) = if config.qpack_decoder_stream_first {
+            let decoder = future::poll_fn(|cx| conn.poll_open_send(cx)).await;
+            (future::poll_fn(|cx| conn.poll_open_send(cx)).await, decoder)
+        } else {
+            (
+                future::poll_fn(|cx| conn.poll_open_send(cx)).await,
+                future::poll_fn(|cx| conn.poll_open_send(cx)).await,
+            )
+        };
 
         let control_send = match control_send {
             Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
@@ -334,6 +343,8 @@ where
             decoder_queue: Queued::default(),
             qpack_encoding: config.qpack_encoder_capacity > 0,
             encoder_queue: Queued::default(),
+            decoder_typed: !config.qpack_lazy_stream_types,
+            encoder_typed: !config.qpack_lazy_stream_types,
             send_grease_frame: config.send_grease_frame,
             // send grease stream if configured
             send_grease_stream_flag: config.send_grease_stream,
@@ -759,6 +770,10 @@ where
         }
 
         let out = self.shared.qpack().decoder_out.split();
+        if !out.is_empty() && !self.decoder_typed {
+            StreamType::DECODER.encode(&mut self.decoder_queue.data);
+            self.decoder_typed = true;
+        }
         self.decoder_queue.data.extend_from_slice(&out);
         let Some(stream) = &mut self.qpack_streams.decoder_send else {
             if self.decoder_queue.data.is_empty() {
@@ -810,6 +825,10 @@ where
         }
 
         let out = self.shared.qpack().encoder_out.split();
+        if !out.is_empty() && !self.encoder_typed {
+            StreamType::ENCODER.encode(&mut self.encoder_queue.data);
+            self.encoder_typed = true;
+        }
         self.encoder_queue.data.extend_from_slice(&out);
         let Some(stream) = &mut self.qpack_streams.encoder_send else {
             if self.encoder_queue.data.is_empty() {

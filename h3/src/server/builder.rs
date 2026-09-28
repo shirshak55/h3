@@ -123,6 +123,21 @@ impl Builder {
         self
     }
 
+    /// Open the QPACK decoder stream before the encoder stream, as Chrome does, so it takes
+    /// the lower stream ID. By default the encoder stream is opened first.
+    pub fn qpack_decoder_stream_first(&mut self, enabled: bool) -> &mut Self {
+        self.config.qpack_decoder_stream_first = enabled;
+        self
+    }
+
+    /// Write each QPACK stream's type only with its first instruction, as Chrome does, so a
+    /// stream that never carries one is never seen by the peer. By default both stream types
+    /// are written right after SETTINGS.
+    pub fn qpack_lazy_stream_types(&mut self, enabled: bool) -> &mut Self {
+        self.config.qpack_lazy_stream_types = enabled;
+        self
+    }
+
     /// Indicates to the peer that WebTransport is supported.
     ///
     /// See: [establishing a webtransport session](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1)
