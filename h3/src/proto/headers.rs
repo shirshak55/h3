@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::TryFrom,
     fmt,
     iter::{IntoIterator, Iterator},
@@ -11,13 +12,18 @@ use http::{
     Extensions, HeaderMap, Method, StatusCode,
 };
 
-use crate::{ext::Protocol, qpack::HeaderField};
+use crate::{
+    ext::{HeaderOrder, Protocol},
+    qpack::HeaderField,
+};
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Clone))]
 pub struct Header {
     pseudo: Pseudo,
     fields: HeaderMap,
+    /// The fields' names in the order to encode them in
+    order: HeaderOrder,
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -35,6 +41,7 @@ impl Header {
             _ => Ok(Self {
                 pseudo: Pseudo::request(method, uri, ext),
                 fields,
+                order: HeaderOrder::default(),
             }),
         }
     }
@@ -43,6 +50,7 @@ impl Header {
         Self {
             pseudo: Pseudo::response(status),
             fields,
+            order: HeaderOrder::default(),
         }
     }
 
@@ -53,7 +61,13 @@ impl Header {
             //# sections.
             pseudo: Pseudo::default(),
             fields,
+            order: HeaderOrder::default(),
         }
+    }
+
+    /// Encodes the fields in `order`.
+    pub fn set_order(&mut self, order: HeaderOrder) {
+        self.order = order;
     }
 
     pub fn into_request_parts(
@@ -139,18 +153,53 @@ impl IntoIterator for Header {
     type Item = HeaderField;
     type IntoIter = HeaderIter;
     fn into_iter(self) -> Self::IntoIter {
+        // A `HeaderMap` can't hold repeats interleaved with other names, so fields in a
+        // recorded order are encoded from a list.
+        let (fields, ordered) = if self.order.0.is_empty() {
+            (self.fields, Vec::new())
+        } else {
+            let ordered = ordered_fields(&self.fields, &self.order.0);
+            (HeaderMap::new(), ordered)
+        };
         HeaderIter {
             pseudo: Some(self.pseudo),
             last_header_name: None,
-            fields: self.fields.into_iter(),
+            fields: fields.into_iter(),
+            ordered: ordered.into_iter(),
         }
     }
+}
+
+/// `fields` in `order`, each listed name taking the next value of that name, then the
+/// values `order` doesn't list, in map order.
+fn ordered_fields(fields: &HeaderMap, order: &[HeaderName]) -> Vec<(HeaderName, HeaderValue)> {
+    let mut taken: HashMap<&HeaderName, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(fields.len());
+    for name in order {
+        let nth = taken.entry(name).or_default();
+        if let Some(value) = fields.get_all(name).iter().nth(*nth) {
+            out.push((name.clone(), value.clone()));
+            *nth += 1;
+        }
+    }
+    for name in fields.keys() {
+        let skip = taken.get(name).copied().unwrap_or_default();
+        out.extend(
+            fields
+                .get_all(name)
+                .iter()
+                .skip(skip)
+                .map(|value| (name.clone(), value.clone())),
+        );
+    }
+    out
 }
 
 pub struct HeaderIter {
     pseudo: Option<Pseudo>,
     last_header_name: Option<HeaderName>,
     fields: header::IntoIter<HeaderValue>,
+    ordered: std::vec::IntoIter<(HeaderName, HeaderValue)>,
 }
 
 impl Iterator for HeaderIter {
@@ -197,7 +246,9 @@ impl Iterator for HeaderIter {
             }
         }
 
-        None
+        self.ordered
+            .next()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()).into())
     }
 }
 
@@ -240,7 +291,11 @@ impl TryFrom<Vec<HeaderField>> for Header {
             }
         }
 
-        Ok(Header { pseudo, fields })
+        Ok(Header {
+            pseudo,
+            fields,
+            order: HeaderOrder::default(),
+        })
     }
 }
 

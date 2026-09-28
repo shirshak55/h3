@@ -27,6 +27,7 @@ use http::{response, HeaderMap, Response};
 use quic::StreamId;
 
 use crate::{
+    ext::HeaderOrder,
     proto::{frame::Frame, headers::Header},
     qpack,
     quic::SendStream as _,
@@ -95,6 +96,16 @@ where
         self.inner.poll_recv_trailers(cx)
     }
 
+    /// Poll for an optional set of trailers for the request, with their fields' names in
+    /// the order its trailer section carries them
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_recv_trailers_with_order(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<(HeaderMap, HeaderOrder)>, StreamError>> {
+        self.inner.poll_recv_trailers_with_order(cx)
+    }
+
     /// Tell the peer to stop sending into the underlying QUIC stream
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_sending(&mut self, error_code: Code) {
@@ -115,13 +126,20 @@ where
     /// Send the HTTP/3 response
     ///
     /// This should be called before trying to send any data with
-    /// [`RequestStream::send_data`].
+    /// [`RequestStream::send_data`]. A response carrying a [`HeaderOrder`] is encoded in
+    /// its order.
     pub async fn send_response(&mut self, resp: Response<()>) -> Result<(), StreamError> {
         let (parts, _) = resp.into_parts();
         let response::Parts {
-            status, headers, ..
+            status,
+            headers,
+            mut extensions,
+            ..
         } = parts;
-        let headers = Header::response(status, headers);
+        let mut headers = Header::response(status, headers);
+        if let Some(order) = extensions.remove::<HeaderOrder>() {
+            headers.set_order(order);
+        }
 
         let mut block = BytesMut::new();
         let mem_size = qpack::encode_stateless(&mut block, headers).map_err(|_e| {
@@ -173,6 +191,17 @@ where
     /// [`RequestStream::finish`] must be called to finalize a request.
     pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
         self.inner.send_trailers(trailers).await
+    }
+
+    /// Send a set of trailers to end the response, their fields in `order`.
+    ///
+    /// [`RequestStream::finish`] must be called to finalize a request.
+    pub async fn send_trailers_with_order(
+        &mut self,
+        trailers: HeaderMap,
+        order: HeaderOrder,
+    ) -> Result<(), StreamError> {
+        self.inner.send_trailers_with_order(trailers, order).await
     }
 
     /// End the response without trailers.

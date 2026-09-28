@@ -47,9 +47,16 @@ impl FromStr for Protocol {
     }
 }
 
-/// The names of a request's header fields in the order its field section carries them,
+/// The names of a message's header fields in the order its field section carries them,
 /// repeats included, which a `HeaderMap` loses by grouping a repeated name's values.
 ///
-/// The server inserts one into each request it receives.
+/// The server inserts one into each request it receives, and encodes a response sent
+/// with one in its order: each listed name takes the next value of that name, and values
+/// it doesn't list follow in map order. Trailers carry theirs beside the map, through
+/// [`RequestStream::poll_recv_trailers_with_order`] and
+/// [`RequestStream::send_trailers_with_order`].
+///
+/// [`RequestStream::poll_recv_trailers_with_order`]: crate::server::RequestStream::poll_recv_trailers_with_order
+/// [`RequestStream::send_trailers_with_order`]: crate::server::RequestStream::send_trailers_with_order
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeaderOrder(pub Vec<HeaderName>);

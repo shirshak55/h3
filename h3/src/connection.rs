@@ -7,7 +7,7 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{future, ready};
-use http::HeaderMap;
+use http::{HeaderMap, HeaderName};
 use stream::WriteBuf;
 
 #[cfg(feature = "tracing")]
@@ -22,6 +22,7 @@ use crate::{
         internal_error::InternalConnectionError,
         Code, ConnectionError, StreamError,
     },
+    ext::HeaderOrder,
     frame::{FrameStream, FrameStreamError},
     proto::{
         frame::{self, Frame, PayloadLen},
@@ -914,6 +915,17 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, StreamError>> {
+        self.poll_recv_trailers_with_order(cx)
+            .map_ok(|trailers| trailers.map(|(trailers, _)| trailers))
+    }
+
+    /// Poll receive trailers and their fields' names in the order the trailer section
+    /// carries them, repeats included.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_recv_trailers_with_order(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<(HeaderMap, HeaderOrder)>, StreamError>> {
         let mut trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
@@ -1012,7 +1024,12 @@ where
                 }
             };
 
-        Poll::Ready(Ok(Some(
+        let order = fields
+            .iter()
+            .filter_map(|field| HeaderName::from_bytes(&field.name).ok())
+            .collect();
+
+        Poll::Ready(Ok(Some((
             Header::try_from(fields)
                 .map_err(|_e| {
                     self.stop_sending(Code::H3_MESSAGE_ERROR);
@@ -1022,7 +1039,8 @@ where
                     }
                 })?
                 .into_fields(),
-        )))
+            HeaderOrder(order),
+        ))))
     }
 
     #[allow(missing_docs)]
@@ -1051,19 +1069,31 @@ where
     /// Send a set of trailers to end the request.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), StreamError> {
+        self.send_trailers_with_order(trailers, HeaderOrder::default())
+            .await
+    }
+
+    /// Send a set of trailers to end the request, their fields in `order`.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn send_trailers_with_order(
+        &mut self,
+        trailers: HeaderMap,
+        order: HeaderOrder,
+    ) -> Result<(), StreamError> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
         //= type=TODO
         //# Characters in field names MUST be
         //# converted to lowercase prior to their encoding.
         let mut block = BytesMut::new();
 
-        let mem_size =
-            qpack::encode_stateless(&mut block, Header::trailer(trailers)).map_err(|_e| {
-                self.handle_connection_error_on_stream(InternalConnectionError {
-                    code: Code::H3_INTERNAL_ERROR,
-                    message: "Failed to encode trailers".to_string(),
-                })
-            })?;
+        let mut trailers = Header::trailer(trailers);
+        trailers.set_order(order);
+        let mem_size = qpack::encode_stateless(&mut block, trailers).map_err(|_e| {
+            self.handle_connection_error_on_stream(InternalConnectionError {
+                code: Code::H3_INTERNAL_ERROR,
+                message: "Failed to encode trailers".to_string(),
+            })
+        })?;
 
         let max_mem_size = self.settings().max_field_section_size;
 
