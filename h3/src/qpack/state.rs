@@ -12,7 +12,10 @@ use crate::ext::QpackEncoderUse;
 
 use super::{
     decoder::{decode_stateless, Decoded, Decoder, DecoderError},
+    encode_stateless,
+    encoder::{DynamicEncoder, EncoderError},
     stream::{HeaderAck, InsertCountIncrement, StreamCancel},
+    HeaderField,
 };
 
 /// Decoding with the dynamic table the peer's encoder stream builds
@@ -33,14 +36,18 @@ struct DynamicDecoding {
 #[derive(Default)]
 pub(crate) struct QpackState {
     decoding: Option<DynamicDecoding>,
+    encoding: Option<DynamicEncoder>,
     /// Decoder-stream instructions waiting for the connection driver to write them
     pub(crate) decoder_out: BytesMut,
+    /// Encoder-stream instructions waiting for the connection driver to write them
+    pub(crate) encoder_out: BytesMut,
 }
 
 impl std::fmt::Debug for QpackState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QpackState")
             .field("decoding", &self.decoding.is_some())
+            .field("encoding", &self.encoding.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -155,6 +162,53 @@ impl QpackState {
             !unblocked
         });
         Ok(())
+    }
+
+    /// Encodes field sections with the peer's dynamic table, of up to `max_capacity` bytes, once
+    /// its SETTINGS allow one.
+    pub(crate) fn enable_encoding(&mut self, max_capacity: usize) {
+        self.encoding = Some(DynamicEncoder::new(max_capacity));
+    }
+
+    /// Takes the peer's QPACK SETTINGS: the encoder sets the dynamic table capacity they allow.
+    pub(crate) fn on_peer_settings(&mut self, max_capacity: u64, max_blocked: u64) {
+        if let Some(encoding) = &mut self.encoding {
+            encoding.on_peer_settings(max_capacity, max_blocked, &mut self.encoder_out);
+        }
+    }
+
+    /// Encodes a field section sent on `stream_id` into `block`, with the peer's dynamic table
+    /// when it is in use, statelessly otherwise. Returns the section's size; with the dynamic
+    /// table, a section larger than `max_size` is not encoded.
+    pub(crate) fn encode(
+        &mut self,
+        stream_id: u64,
+        fields: impl IntoIterator<Item = HeaderField>,
+        block: &mut BytesMut,
+        max_size: u64,
+    ) -> Result<u64, EncoderError> {
+        let Some(encoding) = self.encoding.as_mut().filter(|e| e.active()) else {
+            return encode_stateless(block, fields);
+        };
+        let fields: Vec<HeaderField> = fields.into_iter().collect();
+        let size = fields.iter().map(|f| f.mem_size() as u64).sum();
+        if size > max_size {
+            return Ok(size);
+        }
+        encoding.encode(stream_id, block, &mut self.encoder_out, fields)
+    }
+
+    /// Whether field sections are encoded with the peer's dynamic table
+    pub(crate) fn encoding_active(&self) -> bool {
+        self.encoding.as_ref().is_some_and(|e| e.active())
+    }
+
+    /// Applies instructions read from the peer's decoder stream.
+    pub(crate) fn on_decoder_stream(&mut self, data: &mut impl Buf) -> Result<(), EncoderError> {
+        match &mut self.encoding {
+            Some(encoding) => encoding.on_decoder_stream(data),
+            None => Ok(()),
+        }
     }
 
     /// Forgets a stream abandoned before its end and, as its unprocessed field sections may

@@ -6,13 +6,14 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::task::AtomicWaker;
 
 use crate::{
     config::Settings,
     error::internal_error::ErrorOrigin,
-    qpack::{Decoded, DecoderError, QpackState},
+    proto::headers::Header,
+    qpack::{Decoded, DecoderError, EncoderError, QpackState},
 };
 
 #[derive(Debug)]
@@ -64,6 +65,25 @@ impl SharedState {
             self.waker.wake();
         }
         decoded
+    }
+}
+
+impl SharedState {
+    /// Encodes a field section sent on `stream_id` (see [`QpackState::encode`]), waking the
+    /// connection driver to send the encoder instructions this queues.
+    pub(crate) fn encode(
+        &self,
+        stream_id: u64,
+        fields: Header,
+        block: &mut BytesMut,
+        max_size: u64,
+    ) -> Result<u64, EncoderError> {
+        let mut qpack = self.qpack();
+        let size = qpack.encode(stream_id, fields, block, max_size);
+        if !qpack.encoder_out.is_empty() {
+            self.waker.wake();
+        }
+        size
     }
 }
 

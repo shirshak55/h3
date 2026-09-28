@@ -1,6 +1,10 @@
-use std::{cmp, io::Cursor};
+use std::{
+    cmp,
+    collections::{HashMap, VecDeque},
+    io::Cursor,
+};
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, BytesMut};
 
 use super::{
     block::{
@@ -28,6 +32,10 @@ pub enum EncoderError {
     InvalidString(StringError),
     InvalidInteger(IntError),
     UnknownDecoderInstruction(u8),
+    /// A Section Acknowledgment for a stream with no unacknowledged field section
+    UnexpectedAck(u64),
+    /// An Insert Count Increment of 0 or beyond the inserts sent
+    InvalidIncrement(u64),
 }
 
 impl std::error::Error for EncoderError {}
@@ -41,6 +49,14 @@ impl std::fmt::Display for EncoderError {
             EncoderError::UnknownDecoderInstruction(e) => {
                 write!(f, "got unkown decoder instruction: {}", e)
             }
+            EncoderError::UnexpectedAck(id) => {
+                write!(
+                    f,
+                    "section acknowledgment for stream {} without one due",
+                    id
+                )
+            }
+            EncoderError::InvalidIncrement(n) => write!(f, "invalid insert count increment {}", n),
         }
     }
 }
@@ -186,6 +202,319 @@ impl Default for Encoder {
         Self {
             table: DynamicTable::new(),
         }
+    }
+}
+
+/// Field names whose values rarely repeat, or are secrets, which are not inserted
+const NOT_INSERTED: &[&[u8]] = &[
+    b":path",
+    b"content-length",
+    b"date",
+    b"etag",
+    b"last-modified",
+    b"if-modified-since",
+    b"if-none-match",
+    b"authorization",
+    b"proxy-authorization",
+];
+
+/// A field section sent with a Required Insert Count above 0, not acknowledged yet
+struct Section {
+    required: usize,
+    /// The smallest absolute index it references
+    min_ref: usize,
+}
+
+/// How a field line is encoded
+enum Line {
+    Static(usize),
+    StaticName(usize, Vec<u8>),
+    Dynamic(usize),
+    DynamicName(usize, Vec<u8>),
+    Literal(HeaderField),
+}
+
+/// Encodes field sections with the peer's dynamic table.
+///
+/// Once the peer's SETTINGS allow a capacity, it sets the smaller of that and its own
+/// maximum. Each field without an exact static-table match is referenced if an identical
+/// entry exists, else inserted (unless its name is in `NOT_INSERTED` or it would take more
+/// than half the capacity) and referenced; otherwise it is a literal with a static or dynamic
+/// name reference when one exists. An entry not yet acknowledged by the peer is only
+/// referenced while the stream may block (the peer's SETTINGS_QPACK_BLOCKED_STREAMS), and an
+/// entry is evicted only once acknowledged and no unacknowledged section references it. As in
+/// Chrome's encoder, the oldest entries, up to a quarter of the capacity, are draining: they
+/// are not referenced, but duplicated, so they can be evicted.
+/// Strings are Huffman-encoded; the Base is the Required Insert Count, so references are
+/// relative, never post-base.
+pub(crate) struct DynamicEncoder {
+    /// The largest capacity this encoder sets
+    max_capacity: usize,
+    /// The peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY, which the Required Insert Count encoding uses
+    peer_max_capacity: usize,
+    /// The peer's SETTINGS_QPACK_BLOCKED_STREAMS
+    peer_max_blocked: usize,
+    capacity: usize,
+    entries: VecDeque<HeaderField>,
+    /// The absolute index of `entries[0]`: how many entries were evicted
+    dropped: usize,
+    size: usize,
+    known_received: usize,
+    sections: HashMap<u64, VecDeque<Section>>,
+    /// Decoder-stream bytes not yet forming a whole instruction
+    pending: BytesMut,
+}
+
+impl DynamicEncoder {
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            max_capacity,
+            peer_max_capacity: 0,
+            peer_max_blocked: 0,
+            capacity: 0,
+            entries: VecDeque::new(),
+            dropped: 0,
+            size: 0,
+            known_received: 0,
+            sections: HashMap::new(),
+            pending: BytesMut::new(),
+        }
+    }
+
+    /// Takes the peer's QPACK SETTINGS, setting the table capacity if they allow one.
+    pub fn on_peer_settings(
+        &mut self,
+        max_capacity: u64,
+        max_blocked: u64,
+        encoder: &mut BytesMut,
+    ) {
+        self.peer_max_capacity = usize::try_from(max_capacity).unwrap_or(usize::MAX);
+        self.peer_max_blocked = usize::try_from(max_blocked).unwrap_or(usize::MAX);
+        self.capacity = self.max_capacity.min(self.peer_max_capacity);
+        if self.capacity > 0 {
+            DynamicTableSizeUpdate(self.capacity).encode(encoder);
+        }
+    }
+
+    /// Whether field sections use the dynamic table: the peer allowed a capacity
+    pub fn active(&self) -> bool {
+        self.capacity > 0
+    }
+
+    fn inserted(&self) -> usize {
+        self.dropped + self.entries.len()
+    }
+
+    fn blocking(&self, stream_id: u64) -> bool {
+        self.sections
+            .get(&stream_id)
+            .is_some_and(|sections| sections.iter().any(|s| s.required > self.known_received))
+    }
+
+    /// The newest entry equal to `field`, or only its name
+    fn find(&self, field: &HeaderField, name_only: bool) -> Option<usize> {
+        self.entries
+            .iter()
+            .rposition(|entry| {
+                entry.name == field.name && (name_only || entry.value == field.value)
+            })
+            .map(|pos| self.dropped + pos)
+    }
+
+    /// The absolute index below which entries are draining: the oldest entries until a quarter
+    /// of the capacity would be free
+    fn draining_index(&self) -> usize {
+        let required = self.capacity / 4;
+        let mut free = self.capacity - self.size;
+        let mut index = self.dropped;
+        for entry in &self.entries {
+            if free >= required {
+                break;
+            }
+            free += entry.mem_size();
+            index += 1;
+        }
+        index
+    }
+
+    /// Inserts `field`, evicting acknowledged entries no section references, below `min_ref`
+    fn insert(
+        &mut self,
+        field: &HeaderField,
+        min_ref: usize,
+        encoder: &mut BytesMut,
+    ) -> Result<Option<usize>, EncoderError> {
+        let size = field.mem_size();
+        if NOT_INSERTED.contains(&field.name.as_ref()) || size * 2 > self.capacity {
+            return Ok(None);
+        }
+        let pinned = self
+            .sections
+            .values()
+            .flatten()
+            .map(|s| s.min_ref)
+            .fold(min_ref, cmp::min)
+            .min(self.known_received);
+        let mut evict = 0;
+        let mut free = self.capacity - self.size;
+        while free < size {
+            if self.dropped + evict >= pinned {
+                return Ok(None);
+            }
+            free += self.entries[evict].mem_size();
+            evict += 1;
+        }
+
+        let inserted = self.inserted();
+        let kept = self.dropped + evict;
+        if let Some(absolute) = self.find(field, false).filter(|&a| a >= kept) {
+            Duplicate(inserted - 1 - absolute).encode(encoder);
+        } else if let Some(index) = StaticTable::find_name(&field.name) {
+            InsertWithNameRef::new_static(index, field.value.clone()).encode(encoder)?;
+        } else if let Some(absolute) = self.find(field, true).filter(|&a| a >= kept) {
+            InsertWithNameRef::new_dynamic(inserted - 1 - absolute, field.value.clone())
+                .encode(encoder)?;
+        } else {
+            InsertWithoutNameRef::new(field.name.clone(), field.value.clone()).encode(encoder)?;
+        }
+        for evicted in self.entries.drain(..evict) {
+            self.size -= evicted.mem_size();
+        }
+        self.dropped += evict;
+        self.size += size;
+        self.entries.push_back(field.clone());
+        Ok(Some(inserted))
+    }
+
+    /// Encodes a field section sent on `stream_id` into `block`, and the inserts it makes into
+    /// `encoder`. Returns the section's size.
+    pub fn encode<T, H>(
+        &mut self,
+        stream_id: u64,
+        block: &mut BytesMut,
+        encoder: &mut BytesMut,
+        fields: T,
+    ) -> Result<u64, EncoderError>
+    where
+        T: IntoIterator<Item = H>,
+        H: AsRef<HeaderField>,
+    {
+        //= https://www.rfc-editor.org/rfc/rfc9204#section-2.1.2
+        //# An encoder MUST limit the number of streams that could become blocked
+        //# to the value of SETTINGS_QPACK_BLOCKED_STREAMS at all times.
+        let blocking = self
+            .sections
+            .keys()
+            .filter(|&&id| self.blocking(id))
+            .count();
+        let may_block = self.blocking(stream_id) || blocking < self.peer_max_blocked;
+
+        let mut size = 0;
+        let mut min_ref = usize::MAX;
+        let mut required = 0;
+        let mut lines = Vec::new();
+        for field in fields {
+            let field = field.as_ref();
+            size += field.mem_size() as u64;
+            let known_received = self.known_received;
+            let draining = self.draining_index();
+            let usable =
+                |absolute: usize| absolute >= draining && (absolute < known_received || may_block);
+            let exact = self.find(field, false);
+            // An identical entry that is not draining is only not referenceable yet
+            let insert = !exact.is_some_and(|absolute| absolute >= draining);
+            let line = if let Some(index) = StaticTable::find(field) {
+                Line::Static(index)
+            } else if let Some(absolute) = exact.filter(|&a| usable(a)) {
+                Line::Dynamic(absolute)
+            } else if let Some(absolute) = match insert {
+                true => self.insert(field, min_ref, encoder)?.filter(|_| may_block),
+                false => None,
+            } {
+                Line::Dynamic(absolute)
+            } else if let Some(index) = StaticTable::find_name(&field.name) {
+                Line::StaticName(index, field.value.to_vec())
+            } else if let Some(absolute) = self.find(field, true).filter(|&a| usable(a)) {
+                Line::DynamicName(absolute, field.value.to_vec())
+            } else {
+                Line::Literal(field.clone())
+            };
+            if let Line::Dynamic(absolute) | Line::DynamicName(absolute, _) = line {
+                min_ref = min_ref.min(absolute);
+                required = required.max(absolute + 1);
+            }
+            lines.push(line);
+        }
+
+        HeaderPrefix::new(required, required, self.inserted(), self.peer_max_capacity)
+            .encode(block);
+        for line in lines {
+            match line {
+                Line::Static(index) => Indexed::Static(index).encode(block),
+                Line::StaticName(index, value) => {
+                    LiteralWithNameRef::new_static(index, value).encode(block)?
+                }
+                Line::Dynamic(absolute) => Indexed::Dynamic(required - 1 - absolute).encode(block),
+                Line::DynamicName(absolute, value) => {
+                    LiteralWithNameRef::new_dynamic(required - 1 - absolute, value).encode(block)?
+                }
+                Line::Literal(field) => Literal::new(field.name, field.value).encode(block)?,
+            }
+        }
+        if required > 0 {
+            self.sections
+                .entry(stream_id)
+                .or_default()
+                .push_back(Section { required, min_ref });
+        }
+        Ok(size)
+    }
+
+    /// Applies instructions read from the peer's decoder stream.
+    pub fn on_decoder_stream(&mut self, data: &mut impl Buf) -> Result<(), EncoderError> {
+        while data.has_remaining() {
+            let chunk = data.chunk();
+            self.pending.put_slice(chunk);
+            let len = chunk.len();
+            data.advance(len);
+        }
+        while let Some(instruction) = Action::parse(&mut self.pending)? {
+            match instruction {
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.1
+                //# If an encoder receives a Section Acknowledgment instruction referring
+                //# to a stream on which every encoded field section with a non-zero
+                //# Required Insert Count has already been acknowledged, this MUST be
+                //# treated as a connection error of type QPACK_DECODER_STREAM_ERROR.
+                Action::Untrack(stream_id) => {
+                    let sections = self
+                        .sections
+                        .get_mut(&stream_id)
+                        .ok_or(EncoderError::UnexpectedAck(stream_id))?;
+                    let section = sections
+                        .pop_front()
+                        .ok_or(EncoderError::UnexpectedAck(stream_id))?;
+                    if sections.is_empty() {
+                        self.sections.remove(&stream_id);
+                    }
+                    self.known_received = self.known_received.max(section.required);
+                }
+                Action::StreamCancel(stream_id) => {
+                    self.sections.remove(&stream_id);
+                }
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.3
+                //# An encoder that receives an Increment field equal to zero, or one
+                //# that increases the Known Received Count beyond what the encoder has
+                //# sent, MUST treat this as a connection error of type
+                //# QPACK_DECODER_STREAM_ERROR.
+                Action::ReceivedRefIncrement(increment) => {
+                    if increment == 0 || self.known_received + increment > self.inserted() {
+                        return Err(EncoderError::InvalidIncrement(increment as u64));
+                    }
+                    self.known_received += increment;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -16,6 +16,8 @@ pub struct Config {
     pub(crate) send_control_grease_frame: bool,
     /// SETTINGS sent verbatim instead of the ones generated from `settings`
     pub(crate) raw_settings: Option<frame::Settings>,
+    /// The largest QPACK dynamic table capacity the encoder sets; 0 encodes statelessly
+    pub(crate) qpack_encoder_capacity: u64,
 
     #[cfg(test)]
     pub(crate) send_settings: bool,
@@ -95,6 +97,7 @@ impl TryFrom<Config> for frame::Settings {
             send_grease_stream: _,
             send_control_grease_frame: _,
             raw_settings,
+            qpack_encoder_capacity: _,
             #[cfg(test)]
                 send_settings: _,
             settings:
@@ -223,6 +226,7 @@ impl Default for Config {
             send_grease_stream: true,
             send_control_grease_frame: false,
             raw_settings: None,
+            qpack_encoder_capacity: 0,
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),

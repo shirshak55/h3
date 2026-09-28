@@ -21,7 +21,6 @@ use crate::{
     },
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
-    qpack,
     quic::{self, SendStream as _, StreamId},
     shared_state::{ConnectionState, QpackStreamEnd, SharedState},
     stream::{self, BufRecvStream},
@@ -195,12 +194,21 @@ where
         //# more cookie-pairs, before compression.
 
         let mut block = BytesMut::new();
-        let mem_size = qpack::encode_stateless(&mut block, headers).map_err(|_e| {
-            self.handle_connection_error_on_stream(InternalConnectionError {
-                code: Code::H3_INTERNAL_ERROR,
-                message: "Failed to encode headers".to_string(),
-            })
-        })?;
+        let peer_max_field_section_size = self.settings().max_field_section_size;
+        let mem_size = self
+            .conn_state
+            .encode(
+                stream.send_id().into_inner(),
+                headers,
+                &mut block,
+                peer_max_field_section_size,
+            )
+            .map_err(|_e| {
+                self.handle_connection_error_on_stream(InternalConnectionError {
+                    code: Code::H3_INTERNAL_ERROR,
+                    message: "Failed to encode headers".to_string(),
+                })
+            })?;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
         //# An implementation that
@@ -210,7 +218,6 @@ where
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
         //# An HTTP implementation MUST NOT send frames or requests that would be
         //# invalid based on its current understanding of the peer's settings.
-        let peer_max_field_section_size = self.settings().max_field_section_size;
         if mem_size > peer_max_field_section_size {
             return Err(StreamError::HeaderTooBig {
                 actual_size: mem_size,

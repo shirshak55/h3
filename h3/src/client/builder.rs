@@ -147,6 +147,25 @@ impl Builder {
         self
     }
 
+    /// Encode field sections with the peer's QPACK dynamic table: once its SETTINGS allow a
+    /// capacity above 0, send Set Dynamic Table Capacity with the smaller of that and
+    /// `capacity`, then insert fields on the encoder stream and reference them, within the
+    /// peer's blocked-streams limit, and read its decoder stream. 0 (the default) encodes
+    /// without a dynamic table, as before.
+    ///
+    /// A field without an exact static-table match is referenced if an identical entry exists,
+    /// else inserted (unless it takes more than half the capacity, or is `:path`,
+    /// `content-length`, `date`, `etag`, `last-modified`, `if-modified-since`, `if-none-match`,
+    /// `authorization` or `proxy-authorization`) and referenced, else sent as a literal with a
+    /// static or dynamic name reference when one exists. Strings are Huffman-encoded. Entries
+    /// are evicted oldest first, only once acknowledged and unreferenced.
+    ///
+    /// The connection must be driven (polled) for the encoder stream to be written.
+    pub fn qpack_encoder_capacity(&mut self, capacity: u64) -> &mut Self {
+        self.config.qpack_encoder_capacity = capacity;
+        self
+    }
+
     /// Indicates that the client supports HTTP/3 datagrams
     ///
     /// See: <https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1>
