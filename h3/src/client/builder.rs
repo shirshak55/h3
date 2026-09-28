@@ -111,9 +111,27 @@ impl Builder {
         self
     }
 
-    /// Send a reserved frame on the control stream right after the SETTINGS frame
+    /// Send a reserved frame on the control stream right after the SETTINGS frame, of a random
+    /// type with a 6-byte payload. [`Builder::control_frames`] sends one of a given type and
+    /// payload instead.
     pub fn send_control_grease_frame(&mut self, enabled: bool) -> &mut Self {
         self.config.send_control_grease_frame = enabled;
+        self
+    }
+
+    /// Send these frames on the control stream after SETTINGS (and the reserved frame of
+    /// [`Builder::send_control_grease_frame`]), in this order: a client's recorded frames, such
+    /// as a reserved (GREASE) [`ControlFrame::Other`] with its type and payload length, or
+    /// MAX_PUSH_ID. After a MAX_PUSH_ID the client tolerates the server's pushes, cancelling
+    /// them. A frame with a value that is not a valid variable-length integer fails
+    /// [`Builder::build`].
+    ///
+    /// [`ControlFrame::Other`]: crate::ext::ControlFrame::Other
+    pub fn control_frames(
+        &mut self,
+        frames: impl IntoIterator<Item = crate::ext::ControlFrame>,
+    ) -> &mut Self {
+        self.config.control_frames = frames.into_iter().collect();
         self
     }
 

@@ -91,7 +91,7 @@ where
 }
 
 /// Converts a [`ErrorOrigin`] into a [`ConnectionError`] and sets self.handled_connection_error
-fn convert_to_connection_error(error: ErrorOrigin) -> ConnectionError {
+pub(crate) fn convert_to_connection_error(error: ErrorOrigin) -> ConnectionError {
     match error {
         ErrorOrigin::Internal(internal_error) => ConnectionError::Local {
             error: LocalError::Application {

@@ -126,6 +126,8 @@ where
     /// The QPACK streams' types were written
     decoder_typed: bool,
     encoder_typed: bool,
+    /// Control-stream frames being written after SETTINGS
+    control_queue: Queued,
     pub(crate) handled_connection_error: Option<ConnectionError>,
     pub send_grease_frame: bool,
     // tells if the grease steam should be sent
@@ -217,6 +219,15 @@ where
         UniStreamHeader::Control(settings).encode(&mut control_header);
         if self.config.send_control_grease_frame {
             Frame::<B>::Grease.encode(&mut control_header);
+        }
+        if !self.config.control_frames.iter().all(|f| f.is_valid()) {
+            return Err(self.handle_connection_error(InternalConnectionError::new(
+                Code::H3_INTERNAL_ERROR,
+                "a control frame value is not a valid variable-length integer".to_string(),
+            )));
+        }
+        for frame in &self.config.control_frames {
+            frame.encode(&mut control_header);
         }
 
         let mut decoder_send = Option::take(&mut self.qpack_streams.decoder_send);
@@ -352,6 +363,7 @@ where
             encoder_queue: Queued::default(),
             decoder_typed: !config.qpack_lazy_stream_types,
             encoder_typed: !config.qpack_lazy_stream_types,
+            control_queue: Queued::default(),
             send_grease_frame: config.send_grease_frame,
             // send grease stream if configured
             send_grease_stream_flag: config.send_grease_stream,
@@ -398,6 +410,15 @@ where
 
         *sent_closing = Some(max_id);
         self.set_closing();
+
+        // Frames queued for the control stream go first, and none may be half-written.
+        let out = self.shared.control_out().split();
+        self.control_queue.data.extend_from_slice(&out);
+        if let Err(e) =
+            future::poll_fn(|cx| self.control_queue.poll_write(&mut self.control_send, cx)).await
+        {
+            return Err(self.critical_stream_error(e, "control"));
+        }
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-3.3
         //# When either endpoint chooses to close the HTTP/3
@@ -579,6 +600,7 @@ where
             // TODO
             self.poll_accept_recv(cx)?;
             self.poll_qpack(cx)?;
+            self.poll_control_send(cx)?;
             if let Some(v) = &mut self.control_recv {
                 v
             } else {
@@ -863,6 +885,16 @@ where
         };
         match self.encoder_queue.poll_write(stream, cx) {
             Poll::Ready(Err(e)) => Err(self.critical_stream_error(e, "QPACK encoder")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Writes the control-stream frames streams queued.
+    fn poll_control_send(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
+        let out = self.shared.control_out().split();
+        self.control_queue.data.extend_from_slice(&out);
+        match self.control_queue.poll_write(&mut self.control_send, cx) {
+            Poll::Ready(Err(e)) => Err(self.critical_stream_error(e, "control")),
             _ => Ok(()),
         }
     }

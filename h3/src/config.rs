@@ -22,6 +22,8 @@ pub struct Config {
     pub(crate) qpack_decoder_stream_first: bool,
     /// Write each QPACK stream's type only with its first instruction
     pub(crate) qpack_lazy_stream_types: bool,
+    /// Frames sent on the control stream after SETTINGS
+    pub(crate) control_frames: Vec<crate::ext::ControlFrame>,
 
     #[cfg(test)]
     pub(crate) send_settings: bool,
@@ -104,6 +106,7 @@ impl TryFrom<Config> for frame::Settings {
             qpack_encoder_capacity: _,
             qpack_decoder_stream_first: _,
             qpack_lazy_stream_types: _,
+            control_frames: _,
             #[cfg(test)]
                 send_settings: _,
             settings:
@@ -235,6 +238,7 @@ impl Default for Config {
             qpack_encoder_capacity: 0,
             qpack_decoder_stream_first: false,
             qpack_lazy_stream_types: false,
+            control_frames: Vec::new(),
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),

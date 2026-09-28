@@ -29,6 +29,8 @@ pub struct SharedState {
     waker: AtomicWaker,
     /// The QPACK dynamic table state
     qpack: Mutex<QpackState>,
+    /// Control-stream frames waiting for the connection driver to write them
+    control_out: Mutex<BytesMut>,
 }
 
 impl Default for SharedState {
@@ -39,11 +41,24 @@ impl Default for SharedState {
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
             qpack: Mutex::new(QpackState::default()),
+            control_out: Mutex::new(BytesMut::new()),
         }
     }
 }
 
 impl SharedState {
+    pub(crate) fn control_out(&self) -> MutexGuard<'_, BytesMut> {
+        self.control_out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Queues `frame` for the connection driver to write on the control stream.
+    pub(crate) fn send_control_frame(&self, frame: &crate::ext::ControlFrame) {
+        frame.encode(&mut *self.control_out());
+        self.waker.wake();
+    }
+
     pub(crate) fn qpack(&self) -> MutexGuard<'_, QpackState> {
         self.qpack
             .lock()

@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_util::future;
 use http::request;
 
@@ -16,8 +16,9 @@ use tracing::{info, instrument, trace};
 use crate::{
     connection::{self, ConnectionInner},
     error::{
-        connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
-        ConnectionError, StreamError,
+        connection_error_creators::{convert_to_connection_error, CloseStream},
+        internal_error::InternalConnectionError,
+        Code, ConnectionError, StreamError,
     },
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
@@ -242,6 +243,44 @@ where
         // send the grease frame only once
         self.send_grease_frame = false;
         Ok(request_stream)
+    }
+}
+
+impl<T, B> SendRequest<T, B>
+where
+    T: quic::OpenStreams<B>,
+    B: Buf,
+{
+    /// Send a PRIORITY_UPDATE (RFC 9218) for the request stream `stream_id` on the control
+    /// stream, with the Priority Field Value `priority` (e.g. `u=0, i`), for instance mirroring
+    /// one a client sent for the request forwarded on `stream_id`. The connection driver writes
+    /// it. The stream may be one this client has not opened yet.
+    pub fn send_priority_update(
+        &self,
+        stream_id: StreamId,
+        priority: impl Into<Bytes>,
+    ) -> Result<(), StreamError> {
+        if let Some(error) = self.get_conn_error() {
+            return Err(StreamError::ConnectionError(convert_to_connection_error(
+                error,
+            )));
+        }
+        //= https://www.rfc-editor.org/rfc/rfc9218#section-7.1
+        //# The request-stream variant of PRIORITY_UPDATE (type=0xF0700) MUST
+        //# reference a request stream.
+        if !stream_id.is_request() {
+            return Err(StreamError::StreamError {
+                code: Code::H3_ID_ERROR,
+                reason: format!("{} is not a request stream", stream_id),
+            });
+        }
+        self.conn_state
+            .send_control_frame(&crate::ext::ControlFrame::PriorityUpdate {
+                push: false,
+                id: stream_id.into_inner(),
+                priority: priority.into(),
+            });
+        Ok(())
     }
 }
 

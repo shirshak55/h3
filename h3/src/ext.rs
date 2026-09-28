@@ -2,10 +2,10 @@
 
 use std::str::FromStr;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use http::HeaderName;
 
-use crate::proto::varint::BufExt;
+use crate::proto::varint::{BufExt, BufMutExt, VarInt};
 
 /// Describes the `:protocol` pseudo-header for extended connect
 ///
@@ -92,7 +92,8 @@ pub struct QpackEncoderUse {
     pub blocked_sections: u64,
 }
 
-/// A frame on a control stream after SETTINGS, as recorded from the peer.
+/// A frame on a control stream after SETTINGS: one the peer sent, as recorded, or one a client
+/// sends ([`crate::client::Builder::control_frames`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ControlFrame {
@@ -112,8 +113,9 @@ pub enum ControlFrame {
     CancelPush(u64),
     /// GOAWAY
     Goaway(u64),
-    /// A frame of a reserved (GREASE) or other unknown type with a `len`-byte payload, the
-    /// first 256 bytes of which are kept in `payload`.
+    /// A frame of a reserved (GREASE) or other unknown type with a `len`-byte payload. A
+    /// recorded one keeps the first 256 payload bytes in `payload`; a sent one is `payload`
+    /// padded with zeros to `len` (or cut to it).
     Other {
         /// The frame type
         ty: u64,
@@ -149,5 +151,48 @@ impl ControlFrame {
             (0x7, Some(id)) if !buf.has_remaining() => Self::Goaway(id),
             _ => Self::Other { ty, len, payload },
         }
+    }
+
+    /// Whether every value fits a variable-length integer
+    pub(crate) fn is_valid(&self) -> bool {
+        let values = match self {
+            Self::PriorityUpdate { id, .. } => vec![*id],
+            Self::MaxPushId(id) | Self::CancelPush(id) | Self::Goaway(id) => vec![*id],
+            Self::Other { ty, len, .. } => vec![*ty, *len],
+        };
+        values.into_iter().all(|v| VarInt::from_u64(v).is_ok())
+    }
+
+    pub(crate) fn encode<B: BufMut>(&self, buf: &mut B) {
+        let (ty, payload) = match self {
+            Self::PriorityUpdate { push, id, priority } => {
+                let mut payload = Vec::new();
+                payload.write_var(*id);
+                payload.extend_from_slice(priority);
+                let ty = match push {
+                    true => Self::PRIORITY_UPDATE_PUSH,
+                    false => Self::PRIORITY_UPDATE_REQUEST,
+                };
+                (ty, payload)
+            }
+            Self::MaxPushId(id) | Self::CancelPush(id) | Self::Goaway(id) => {
+                let ty = match self {
+                    Self::MaxPushId(_) => 0xd,
+                    Self::CancelPush(_) => 0x3,
+                    _ => 0x7,
+                };
+                let mut payload = Vec::new();
+                payload.write_var(*id);
+                (ty, payload)
+            }
+            Self::Other { ty, len, payload } => {
+                let mut sent = payload.to_vec();
+                sent.resize(*len as usize, 0);
+                (*ty, sent)
+            }
+        };
+        buf.write_var(ty);
+        buf.write_var(payload.len() as u64);
+        buf.put_slice(&payload);
     }
 }
