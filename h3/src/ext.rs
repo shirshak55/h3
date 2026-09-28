@@ -67,3 +67,24 @@ pub struct HeaderOrder(pub Vec<HeaderName>);
 /// list follow in the default order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PseudoOrder(pub Vec<&'static str>);
+
+/// How the peer used its QPACK encoder stream, as read so far. Only read while this endpoint
+/// advertises a QPACK dynamic table capacity above 0.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct QpackEncoderUse {
+    /// The first 16 Set Dynamic Table Capacity values, in order
+    pub capacities: Vec<u64>,
+    /// Insert With Name Reference instructions naming a static table entry
+    pub inserts_static_name: u64,
+    /// Insert With Name Reference instructions naming a dynamic table entry
+    pub inserts_dynamic_name: u64,
+    /// Insert With Literal Name instructions
+    pub inserts_literal_name: u64,
+    /// Duplicate instructions
+    pub duplicates: u64,
+    /// Field sections received with a Required Insert Count above 0
+    pub dynamic_sections: u64,
+    /// Field sections that waited for encoder-stream instructions (blocked streams)
+    pub blocked_sections: u64,
+}

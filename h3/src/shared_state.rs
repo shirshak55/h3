@@ -2,12 +2,18 @@
 
 use std::{
     borrow::Cow,
-    sync::{atomic::AtomicBool, OnceLock},
+    sync::{atomic::AtomicBool, Mutex, MutexGuard, OnceLock},
+    task::{Context, Poll},
 };
 
+use bytes::Bytes;
 use futures_util::task::AtomicWaker;
 
-use crate::{config::Settings, error::internal_error::ErrorOrigin};
+use crate::{
+    config::Settings,
+    error::internal_error::ErrorOrigin,
+    qpack::{Decoded, DecoderError, QpackState},
+};
 
 #[derive(Debug)]
 /// This struct represents the shared state of the h3 connection and the stream structs
@@ -20,6 +26,8 @@ pub struct SharedState {
     closing: AtomicBool,
     /// Waker for the connection
     waker: AtomicWaker,
+    /// The QPACK dynamic table state
+    qpack: Mutex<QpackState>,
 }
 
 impl Default for SharedState {
@@ -29,6 +37,52 @@ impl Default for SharedState {
             connection_error: OnceLock::new(),
             closing: AtomicBool::new(false),
             waker: AtomicWaker::new(),
+            qpack: Mutex::new(QpackState::default()),
+        }
+    }
+}
+
+impl SharedState {
+    pub(crate) fn qpack(&self) -> MutexGuard<'_, QpackState> {
+        self.qpack
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Decodes a field section received on `stream_id`, waking the connection driver to send
+    /// the QPACK decoder instructions this queues.
+    pub(crate) fn poll_decode(
+        &self,
+        cx: &mut Context<'_>,
+        stream_id: u64,
+        block: &Bytes,
+        max_size: u64,
+    ) -> Poll<Result<Decoded, DecoderError>> {
+        let mut qpack = self.qpack();
+        let decoded = qpack.poll_decode(cx, stream_id, block, max_size);
+        if !qpack.decoder_out.is_empty() {
+            self.waker.wake();
+        }
+        decoded
+    }
+}
+
+/// Tells the peer's QPACK encoder about a request stream abandoned before its end
+pub(crate) struct QpackStreamEnd {
+    pub(crate) shared: std::sync::Arc<SharedState>,
+    pub(crate) stream_id: u64,
+    pub(crate) ended: bool,
+}
+
+impl Drop for QpackStreamEnd {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        let mut qpack = self.shared.qpack();
+        qpack.cancel_stream(self.stream_id);
+        if !qpack.decoder_out.is_empty() {
+            self.shared.waker.wake();
         }
     }
 }

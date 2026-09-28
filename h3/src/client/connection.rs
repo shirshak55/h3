@@ -22,8 +22,8 @@ use crate::{
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
     qpack,
-    quic::{self, StreamId},
-    shared_state::{ConnectionState, SharedState},
+    quic::{self, SendStream as _, StreamId},
+    shared_state::{ConnectionState, QpackStreamEnd, SharedState},
     stream::{self, BufRecvStream},
 };
 
@@ -222,7 +222,8 @@ where
             .await
             .map_err(|e| self.handle_quic_stream_error(e))?;
 
-        let request_stream = RequestStream {
+        let qpack_end = QpackStreamEnd::track(&self.conn_state, stream.send_id());
+        let mut request_stream = RequestStream {
             inner: connection::RequestStream::new(
                 FrameStream::new(BufRecvStream::new(stream)),
                 self.max_field_section_size,
@@ -230,6 +231,7 @@ where
                 self.send_grease_frame,
             ),
         };
+        request_stream.inner.qpack_end = qpack_end;
         // send the grease frame only once
         self.send_grease_frame = false;
         Ok(request_stream)
@@ -392,6 +394,12 @@ where
     pub async fn shutdown(&mut self, _max_push: usize) -> Result<(), ConnectionError> {
         // TODO: Calculate remaining pushes once server push is implemented.
         self.inner.shutdown(&mut self.sent_closing, PushId(0)).await
+    }
+
+    /// How the server used its QPACK encoder stream so far. `None` unless this client
+    /// advertises a dynamic table, as the encoder stream is only read then.
+    pub fn peer_qpack_encoder(&self) -> Option<crate::ext::QpackEncoderUse> {
+        self.inner.peer_qpack_encoder()
     }
 
     /// Wait until the connection is closed

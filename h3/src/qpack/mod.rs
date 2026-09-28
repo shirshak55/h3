@@ -1,3 +1,4 @@
+pub(crate) use self::state::QpackState;
 pub use self::{
     decoder::{decode_stateless, Decoded, DecoderError},
     encoder::{encode_stateless, EncoderError},
@@ -8,6 +9,7 @@ mod block;
 mod dynamic;
 mod field;
 mod parse_error;
+mod state;
 mod static_;
 mod stream;
 mod vas;

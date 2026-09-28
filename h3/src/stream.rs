@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::{future, ready};
 use pin_project_lite::pin_project;
 use tokio::io::ReadBuf;
@@ -50,17 +50,47 @@ where
     B: Buf,
 {
     for chunk in data.chunks(WRITE_BUF_ENCODE_SIZE) {
-        let mut buf = WriteBuf {
-            buf: [0; WRITE_BUF_ENCODE_SIZE],
-            len: chunk.len(),
-            pos: 0,
-            frame: None,
-        };
-        buf.buf[..chunk.len()].copy_from_slice(chunk);
-        write(stream, buf).await?;
+        write(stream, WriteBuf::encoded(chunk)).await?;
     }
 
     Ok(())
+}
+
+/// Bytes already in wire format queued for a unidirectional stream, written as the stream
+/// accepts them
+#[derive(Default)]
+pub(crate) struct Queued {
+    pub(crate) data: BytesMut,
+    /// A piece was handed to the stream and not yet accepted
+    in_flight: bool,
+}
+
+impl Queued {
+    /// Writes the queued bytes, a [`WriteBuf`] at a time.
+    pub(crate) fn poll_write<S, B>(
+        &mut self,
+        stream: &mut S,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StreamErrorIncoming>>
+    where
+        S: SendStream<B>,
+        B: Buf,
+    {
+        loop {
+            if self.in_flight {
+                ready!(stream.poll_ready(cx))?;
+                self.in_flight = false;
+            }
+            if self.data.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            let chunk = self
+                .data
+                .split_to(self.data.len().min(WRITE_BUF_ENCODE_SIZE));
+            stream.send_data(WriteBuf::encoded(&chunk))?;
+            self.in_flight = true;
+        }
+    }
 }
 
 const WRITE_BUF_ENCODE_SIZE: usize = StreamType::MAX_ENCODED_SIZE + Frame::MAX_ENCODED_SIZE;
@@ -86,6 +116,18 @@ impl<B> WriteBuf<B>
 where
     B: Buf,
 {
+    /// Wraps up to `WRITE_BUF_ENCODE_SIZE` bytes already in wire format
+    fn encoded(data: &[u8]) -> Self {
+        let mut buf = Self {
+            buf: [0; WRITE_BUF_ENCODE_SIZE],
+            len: data.len(),
+            pos: 0,
+            frame: None,
+        };
+        buf.buf[..data.len()].copy_from_slice(data);
+        buf
+    }
+
     fn encode_stream_type(&mut self, ty: StreamType) {
         let mut buf_mut = &mut self.buf[self.len..];
 

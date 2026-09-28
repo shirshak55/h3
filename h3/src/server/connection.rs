@@ -24,7 +24,7 @@ use crate::{
         push::PushId,
     },
     quic::{self, SendStream as _},
-    shared_state::{ConnectionState, SharedState},
+    shared_state::{ConnectionState, QpackStreamEnd, SharedState},
     stream::BufRecvStream,
 };
 
@@ -144,6 +144,7 @@ where
         &self,
         stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        let qpack_end = QpackStreamEnd::track(&self.inner.shared, stream.send_id());
         RequestResolver {
             request_end: RequestEnd {
                 request_end: self.request_end_send.clone(),
@@ -153,6 +154,7 @@ where
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),
+            qpack_end,
         }
     }
 
@@ -172,6 +174,14 @@ where
     /// reserved (GREASE) types included.
     pub fn peer_control_frame_types(&self) -> &[u64] {
         self.inner.peer_control_frame_types()
+    }
+
+    /// How the client used its QPACK encoder stream so far: the dynamic table capacities it set,
+    /// its inserts, and the field sections that referenced the table or waited for it. `None`
+    /// unless this server advertises a dynamic table ([`super::Builder::qpack_max_table_capacity`]),
+    /// as the encoder stream is only read then.
+    pub fn peer_qpack_encoder(&self) -> Option<crate::ext::QpackEncoderUse> {
+        self.inner.peer_qpack_encoder()
     }
 
     /// Initiate a graceful shutdown, accepting `max_request` potentially still in-flight

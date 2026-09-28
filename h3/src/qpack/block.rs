@@ -136,17 +136,25 @@ impl HeaderPrefix {
         let required = if self.encoded_insert_count == 0 {
             0
         } else {
-            let mut insert_count = self.encoded_insert_count - 1;
             let max_entries = max_table_size / 32;
-            let mut wrapped = total_inserted % (2 * max_entries);
-
-            if wrapped >= insert_count + max_entries {
-                insert_count += 2 * max_entries;
-            } else if wrapped + max_entries < insert_count {
-                wrapped += 2 * max_entries;
+            let full_range = 2 * max_entries;
+            if self.encoded_insert_count > full_range {
+                return Err(ParseError::InvalidInsertCount(self.encoded_insert_count));
             }
 
-            insert_count + total_inserted - wrapped
+            let max_value = total_inserted + max_entries;
+            let max_wrapped = (max_value / full_range) * full_range;
+            let mut required = max_wrapped + self.encoded_insert_count - 1;
+            if required > max_value {
+                if required <= full_range {
+                    return Err(ParseError::InvalidInsertCount(self.encoded_insert_count));
+                }
+                required -= full_range;
+            }
+            if required == 0 {
+                return Err(ParseError::InvalidInsertCount(self.encoded_insert_count));
+            }
+            required
         };
 
         let base = if required == 0 {

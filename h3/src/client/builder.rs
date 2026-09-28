@@ -122,9 +122,28 @@ impl Builder {
     ///
     /// The client then enforces and reports the MAX_FIELD_SECTION_SIZE, extended CONNECT,
     /// datagram and WebTransport values they carry, overriding the other builder settings.
-    /// QPACK settings are sent as given, but the client keeps decoding without a dynamic table.
+    /// QPACK settings are sent as given and honoured as by [`Builder::qpack_max_table_capacity`]
+    /// and [`Builder::qpack_blocked_streams`].
     pub fn raw_settings(&mut self, settings: impl IntoIterator<Item = (u64, u64)>) -> &mut Self {
         self.config.raw_settings = Some(settings.into_iter().collect());
+        self
+    }
+
+    /// Advertise SETTINGS_QPACK_MAX_TABLE_CAPACITY: above 0, field sections are decoded with a
+    /// QPACK dynamic table of up to this many bytes, built from the peer's encoder stream, and
+    /// acknowledged on the decoder stream. 0 (the default) decodes without one, as before.
+    ///
+    /// The connection must be driven (polled) for the encoder stream to be read.
+    pub fn qpack_max_table_capacity(&mut self, value: u64) -> &mut Self {
+        self.config.settings.qpack_max_table_capacity = value;
+        self
+    }
+
+    /// Advertise SETTINGS_QPACK_BLOCKED_STREAMS: how many streams may wait for the QPACK encoder
+    /// instructions their field sections depend on. More is a QPACK_DECOMPRESSION_FAILED
+    /// connection error.
+    pub fn qpack_blocked_streams(&mut self, value: u64) -> &mut Self {
+        self.config.settings.qpack_blocked_streams = value;
         self
     }
 

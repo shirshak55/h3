@@ -1,6 +1,7 @@
 use std::{convert::TryFrom, sync::Arc};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
+use futures_util::future;
 use http::{HeaderName, Request, StatusCode};
 
 #[cfg(feature = "tracing")]
@@ -20,7 +21,7 @@ use crate::{
     },
     qpack,
     quic::{self, SendStream},
-    shared_state::{ConnectionState, SharedState},
+    shared_state::{ConnectionState, QpackStreamEnd, SharedState},
 };
 
 use super::{connection::RequestEnd, stream::RequestStream};
@@ -40,6 +41,7 @@ where
     pub(super) send_grease_frame: bool,
     pub(super) max_field_section_size: u64,
     pub(super) shared: Arc<SharedState>,
+    pub(super) qpack_end: Option<QpackStreamEnd>,
 }
 
 impl<C, B> ConnectionState for RequestResolver<C, B>
@@ -125,23 +127,31 @@ where
             }
         };
 
-        let decoded = match qpack::decode_stateless(&mut encoded, self.max_field_section_size) {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
-            //# the message header it will accept on an individual HTTP message.
-            Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => Err(cancel_size),
-            Ok(decoded) => Ok(decoded),
-            Err(_e) => {
-                return Err(
-                    self.handle_connection_error_on_stream(InternalConnectionError {
-                        code: Code::QPACK_DECOMPRESSION_FAILED,
-                        message: "Failed to decode headers".to_string(),
-                    }),
-                );
-            }
+        // With a dynamic table, the section may wait for encoder-stream instructions, so it
+        // is decoded when the request resolves.
+        let decoded = if self.qpack_end.is_some() {
+            Decoding::Pending(encoded)
+        } else {
+            Decoding::Done(
+                match qpack::decode_stateless(&mut encoded, self.max_field_section_size) {
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+                    //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+                    //# the message header it will accept on an individual HTTP message.
+                    Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => Err(cancel_size),
+                    Ok(decoded) => Ok(decoded),
+                    Err(_e) => {
+                        return Err(self.handle_connection_error_on_stream(
+                            InternalConnectionError {
+                                code: Code::QPACK_DECOMPRESSION_FAILED,
+                                message: "Failed to decode headers".to_string(),
+                            },
+                        ));
+                    }
+                },
+            )
         };
 
-        let request_stream = RequestStream {
+        let mut request_stream = RequestStream {
             request_end: Arc::new(self.request_end),
             inner: connection::RequestStream::new(
                 self.frame_stream,
@@ -150,13 +160,21 @@ where
                 self.send_grease_frame,
             ),
         };
+        request_stream.inner.qpack_end = self.qpack_end.take();
 
-        Ok(ResolvedRequest::new(
+        Ok(ResolvedRequest {
             request_stream,
             decoded,
-            self.max_field_section_size,
-        ))
+            max_field_section_size: self.max_field_section_size,
+        })
     }
+}
+
+/// A request's header section, decoded or waiting to be
+enum Decoding {
+    // Ok or `REQUEST_HEADER_FIELDS_TO_LARGE` which needs to be sent
+    Done(Result<qpack::Decoded, u64>),
+    Pending(Bytes),
 }
 
 pub struct ResolvedRequest<C, B>
@@ -165,8 +183,7 @@ where
     B: Buf,
 {
     request_stream: RequestStream<C::BidiStream, B>,
-    // Ok or `REQUEST_HEADER_FIELDS_TO_LARGE` which needs to be sent
-    decoded: Result<qpack::Decoded, u64>,
+    decoded: Decoding,
     max_field_section_size: u64,
 }
 
@@ -182,7 +199,7 @@ where
     ) -> Self {
         Self {
             request_stream,
-            decoded,
+            decoded: Decoding::Done(decoded),
             max_field_section_size,
         }
     }
@@ -192,7 +209,30 @@ where
     pub async fn resolve(
         mut self,
     ) -> Result<(Request<()>, RequestStream<C::BidiStream, B>), StreamError> {
-        let fields = match self.decoded {
+        let decoded = match self.decoded {
+            Decoding::Done(decoded) => decoded,
+            Decoding::Pending(encoded) => {
+                let stream_id = self.request_stream.id().into_inner();
+                let shared = self.request_stream.inner.conn_state.clone();
+                match future::poll_fn(|cx| {
+                    shared.poll_decode(cx, stream_id, &encoded, self.max_field_section_size)
+                })
+                .await
+                {
+                    Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => Err(cancel_size),
+                    Ok(decoded) => Ok(decoded),
+                    Err(_e) => {
+                        return Err(self.request_stream.handle_connection_error_on_stream(
+                            InternalConnectionError {
+                                code: Code::QPACK_DECOMPRESSION_FAILED,
+                                message: "Failed to decode headers".to_string(),
+                            },
+                        ));
+                    }
+                }
+            }
+        };
+        let fields = match decoded {
             Ok(v) => v.fields,
             Err(cancel_size) => {
                 // Send and await the error response

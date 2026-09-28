@@ -1,8 +1,10 @@
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, BytesMut};
 use std::{convert::TryInto, fmt, io::Cursor, num::TryFromIntError};
 
 #[cfg(feature = "tracing")]
 use tracing::trace;
+
+use crate::ext::QpackEncoderUse;
 
 use super::{
     dynamic::{DynamicTable, DynamicTableDecoder, Error as DynamicTableError},
@@ -38,6 +40,9 @@ pub enum DecoderError {
     UnexpectedEnd,
     HeaderTooLong(u64),
     BufSize(TryFromIntError),
+    InvalidInsertCount(usize),
+    ReferenceBeyondRequired(usize),
+    CapacityTooLarge(usize),
 }
 
 impl std::error::Error for DecoderError {}
@@ -56,6 +61,23 @@ impl std::fmt::Display for DecoderError {
             DecoderError::UnexpectedEnd => write!(f, "unexpected end"),
             DecoderError::HeaderTooLong(_) => write!(f, "header too long"),
             DecoderError::BufSize(_) => write!(f, "number in buffer wrong size"),
+            DecoderError::InvalidInsertCount(n) => {
+                write!(f, "invalid encoded required insert count: {}", n)
+            }
+            DecoderError::ReferenceBeyondRequired(i) => {
+                write!(
+                    f,
+                    "reference to entry {} beyond the required insert count",
+                    i
+                )
+            }
+            DecoderError::CapacityTooLarge(n) => {
+                write!(
+                    f,
+                    "dynamic table capacity {} above the advertised maximum",
+                    n
+                )
+            }
         }
     }
 }
@@ -74,20 +96,35 @@ pub struct Decoded {
     pub fields: Vec<HeaderField>,
     /// Whether one or more encoded fields were referencing the dynamic table
     pub dyn_ref: bool,
+    /// The field section's Required Insert Count
+    pub required_insert_count: usize,
     /// Decoded size, calculated as stated in "4.1.1.3. Header Size Constraints"
     pub mem_size: u64,
 }
 
 pub struct Decoder {
     table: DynamicTable,
+    /// The SETTINGS_QPACK_MAX_TABLE_CAPACITY this decoder advertised
+    max_capacity: usize,
 }
 
 impl Decoder {
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            table: DynamicTable::new(),
+            max_capacity,
+        }
+    }
+
+    pub fn total_inserted(&self) -> usize {
+        self.table.total_inserted()
+    }
+
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
     pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
-        let (required_ref, base) = HeaderPrefix::decode(buf)?
-            .get(self.table.total_inserted(), self.table.max_mem_size())?;
+        let (required_ref, base) =
+            HeaderPrefix::decode(buf)?.get(self.table.total_inserted(), self.max_capacity)?;
 
         if required_ref > self.table.total_inserted() {
             return Err(DecoderError::MissingRefs(required_ref));
@@ -98,7 +135,7 @@ impl Decoder {
         let mut mem_size = 0;
         let mut fields = Vec::new();
         while buf.has_remaining() {
-            let field = Self::parse_header_field(&decoder_table, buf)?;
+            let field = Self::parse_header_field(&decoder_table, base, required_ref, buf)?;
             mem_size += field.mem_size() as u64;
             fields.push(field);
         }
@@ -107,6 +144,7 @@ impl Decoder {
             fields,
             mem_size,
             dyn_ref: required_ref > 0,
+            required_insert_count: required_ref,
         })
     }
 
@@ -136,6 +174,61 @@ impl Decoder {
         }
 
         Ok(self.table.total_inserted())
+    }
+
+    /// Applies the peer's encoder-stream instructions buffered in `read`, leaving an incomplete
+    /// last instruction there, and records how the peer uses the stream.
+    // https://www.rfc-editor.org/rfc/rfc9204.html#name-encoder-instructions
+    pub fn on_encoder_stream(
+        &mut self,
+        read: &mut BytesMut,
+        usage: &mut QpackEncoderUse,
+    ) -> Result<(), DecoderError> {
+        while let Some(&first) = read.first() {
+            let Some(instruction) = self.parse_instruction(read)? else {
+                break;
+            };
+
+            #[cfg(feature = "tracing")]
+            trace!("instruction {:?}", instruction);
+
+            match instruction {
+                Instruction::TableSizeUpdate(size) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.3.1
+                    //# The decoder MUST treat a new dynamic table capacity
+                    //# value that exceeds this limit as a connection error of type
+                    //# QPACK_ENCODER_STREAM_ERROR.
+                    if size > self.max_capacity {
+                        return Err(DecoderError::CapacityTooLarge(size));
+                    }
+                    self.table.set_max_size(size)?;
+                    if usage.capacities.len() < 16 {
+                        usage.capacities.push(size as u64);
+                    }
+                }
+                Instruction::Insert(field) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9204#section-3.2.2
+                    //# It is an error if the encoder attempts to add an entry that is larger than
+                    //# the dynamic table capacity; the decoder MUST treat this as a connection error
+                    //# of type QPACK_ENCODER_STREAM_ERROR.
+                    if field.mem_size() > self.table.max_mem_size() {
+                        return Err(DecoderError::DynamicTable(
+                            DynamicTableError::MaxTableSizeReached,
+                        ));
+                    }
+                    self.table.put(field)?;
+                    match EncoderInstruction::decode(first) {
+                        EncoderInstruction::InsertWithNameRef if first & 0b0100_0000 != 0 => {
+                            usage.inserts_static_name += 1
+                        }
+                        EncoderInstruction::InsertWithNameRef => usage.inserts_dynamic_name += 1,
+                        EncoderInstruction::InsertWithoutNameRef => usage.inserts_literal_name += 1,
+                        _ => usage.duplicates += 1,
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn parse_instruction<R: Buf>(&self, read: &mut R) -> Result<Option<Instruction>, DecoderError> {
@@ -179,29 +272,45 @@ impl Decoder {
 
     fn parse_header_field<R: Buf>(
         table: &DynamicTableDecoder,
+        base: usize,
+        required: usize,
         buf: &mut R,
     ) -> Result<HeaderField, DecoderError> {
+        //= https://www.rfc-editor.org/rfc/rfc9204#section-2.2.3
+        //# If the decoder encounters a reference in a field line representation
+        //# to a dynamic table entry that has already been evicted or that has an
+        //# absolute index greater than or equal to the declared Required Insert
+        //# Count (Section 4.5.1), it MUST treat this as a connection error of
+        //# type QPACK_DECOMPRESSION_FAILED.
+        let relative = |index: usize| match base.checked_sub(index + 1) {
+            Some(absolute) if absolute < required => table.get_relative(index),
+            _ => Err(DynamicTableError::BadRelativeIndex(index)),
+        };
+        let postbase = |index: usize| {
+            if base + index >= required {
+                return Err(DecoderError::ReferenceBeyondRequired(base + index));
+            }
+            Ok(table.get_postbase(index)?)
+        };
         let first = buf.chunk()[0];
         let field = match HeaderBlockField::decode(first) {
             HeaderBlockField::Indexed => match Indexed::decode(buf)? {
                 Indexed::Static(index) => StaticTable::get(index)?.clone(),
-                Indexed::Dynamic(index) => table.get_relative(index)?.clone(),
+                Indexed::Dynamic(index) => relative(index)?.clone(),
             },
             HeaderBlockField::IndexedWithPostBase => {
                 let index = IndexedWithPostBase::decode(buf)?.0;
-                table.get_postbase(index)?.clone()
+                postbase(index)?.clone()
             }
             HeaderBlockField::LiteralWithNameRef => match LiteralWithNameRef::decode(buf)? {
                 LiteralWithNameRef::Static { index, value } => {
                     StaticTable::get(index)?.with_value(value)
                 }
-                LiteralWithNameRef::Dynamic { index, value } => {
-                    table.get_relative(index)?.with_value(value)
-                }
+                LiteralWithNameRef::Dynamic { index, value } => relative(index)?.with_value(value),
             },
             HeaderBlockField::LiteralWithPostBaseNameRef => {
                 let literal = LiteralWithPostBaseNameRef::decode(buf)?;
-                table.get_postbase(literal.index)?.with_value(literal.value)
+                postbase(literal.index)?.with_value(literal.value)
             }
             HeaderBlockField::Literal => {
                 let literal = Literal::decode(buf)?;
@@ -258,13 +367,17 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
         fields,
         mem_size,
         dyn_ref: false,
+        required_insert_count: 0,
     })
 }
 
 #[cfg(test)]
 impl From<DynamicTable> for Decoder {
     fn from(table: DynamicTable) -> Self {
-        Self { table }
+        Self {
+            max_capacity: table.max_mem_size(),
+            table,
+        }
     }
 }
 
@@ -330,6 +443,7 @@ impl From<ParseError> for DecoderError {
             ParseError::String(x) => DecoderError::InvalidString(x),
             ParseError::InvalidPrefix(p) => DecoderError::UnknownPrefix(p),
             ParseError::InvalidBase(b) => DecoderError::BadBaseIndex(b),
+            ParseError::InvalidInsertCount(n) => DecoderError::InvalidInsertCount(n),
         }
     }
 }
@@ -665,7 +779,7 @@ mod tests {
     #[test]
     fn decode_post_base_name_ref_header_field() {
         let mut buf = vec![];
-        HeaderPrefix::new(2, 2, 4, TABLE_SIZE).encode(&mut buf);
+        HeaderPrefix::new(3, 2, 4, TABLE_SIZE).encode(&mut buf);
         LiteralWithPostBaseNameRef::new(0, "new bar3")
             .encode(&mut buf)
             .unwrap();

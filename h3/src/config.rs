@@ -46,6 +46,10 @@ pub struct Settings {
     pub(crate) enable_datagram: bool,
     /// The maximum number of concurrent streams that can be opened by the peer.
     pub(crate) max_webtransport_sessions: u64,
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY: the QPACK dynamic table capacity the endpoint decodes with
+    pub(crate) qpack_max_table_capacity: u64,
+    /// SETTINGS_QPACK_BLOCKED_STREAMS: how many streams may wait for QPACK encoder instructions
+    pub(crate) qpack_blocked_streams: u64,
 }
 
 impl From<&frame::Settings> for Settings {
@@ -70,6 +74,12 @@ impl From<&frame::Settings> for Settings {
                 .get(frame::SettingId::ENABLE_CONNECT_PROTOCOL)
                 .map(|value| value != 0)
                 .unwrap_or(defaults.enable_extended_connect),
+            qpack_max_table_capacity: settings
+                .get(frame::SettingId::QPACK_MAX_TABLE_CAPACITY)
+                .unwrap_or(defaults.qpack_max_table_capacity),
+            qpack_blocked_streams: settings
+                .get(frame::SettingId::QPACK_MAX_BLOCKED_STREAMS)
+                .unwrap_or(defaults.qpack_blocked_streams),
         }
     }
 }
@@ -94,6 +104,8 @@ impl TryFrom<Config> for frame::Settings {
                     enable_extended_connect,
                     enable_datagram,
                     max_webtransport_sessions,
+                    qpack_max_table_capacity,
+                    qpack_blocked_streams,
                 },
         } = value;
 
@@ -134,6 +146,18 @@ impl TryFrom<Config> for frame::Settings {
             }
         }
 
+        if qpack_max_table_capacity > 0 {
+            settings.insert(
+                frame::SettingId::QPACK_MAX_TABLE_CAPACITY,
+                qpack_max_table_capacity,
+            )?;
+        }
+        if qpack_blocked_streams > 0 {
+            settings.insert(
+                frame::SettingId::QPACK_MAX_BLOCKED_STREAMS,
+                qpack_blocked_streams,
+            )?;
+        }
         settings.insert(
             frame::SettingId::MAX_HEADER_LIST_SIZE,
             max_field_section_size,
@@ -164,6 +188,8 @@ impl Default for Settings {
             enable_extended_connect: false,
             enable_datagram: false,
             max_webtransport_sessions: 0,
+            qpack_max_table_capacity: 0,
+            qpack_blocked_streams: 0,
         }
     }
 }

@@ -97,7 +97,7 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let mut frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
+        let frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
             .await
             .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
             .ok_or_else(|| {
@@ -123,8 +123,16 @@ where
         //# mismatch, it MUST respond with a connection error of type
         //# H3_GENERAL_PROTOCOL_ERROR.
 
-        let decoded = if let Frame::Headers(ref mut encoded) = frame {
-            match qpack::decode_stateless(encoded, self.inner.max_field_section_size) {
+        let decoded = if let Frame::Headers(ref encoded) = frame {
+            let stream_id = self.inner.stream.id().into_inner();
+            let max_size = self.inner.max_field_section_size;
+            let decoded = future::poll_fn(|cx| {
+                self.inner
+                    .conn_state
+                    .poll_decode(cx, stream_id, encoded, max_size)
+            })
+            .await;
+            match decoded {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                 //# An HTTP/3 implementation MAY impose a limit on the maximum size of
                 //# the message header it will accept on an individual HTTP message.

@@ -6,6 +6,7 @@ pub enum ParseError {
     String(prefix_string::Error),
     InvalidPrefix(u8),
     InvalidBase(isize),
+    InvalidInsertCount(usize),
 }
 
 impl From<prefix_int::Error> for ParseError {
