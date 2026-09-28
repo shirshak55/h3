@@ -8,9 +8,8 @@ use tracing::instrument;
 use crate::{
     connection::{self},
     error::{
-        connection_error_creators::{CloseStream, HandleFrameStreamErrorOnRequestStream},
-        internal_error::InternalConnectionError,
-        Code, StreamError,
+        connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
+        StreamError,
     },
     proto::{frame::Frame, headers::Header},
     qpack,
@@ -97,9 +96,8 @@ where
     /// [`recv_data()`]: #method.recv_data
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let frame = future::poll_fn(|cx| self.inner.stream.poll_next(cx))
-            .await
-            .map_err(|e| self.handle_frame_stream_error_on_request_stream(e))?
+        let frame = future::poll_fn(|cx| self.inner.poll_next_frame(cx))
+            .await?
             .ok_or_else(|| {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                 //# Receipt of an invalid sequence of frames MUST be treated as a

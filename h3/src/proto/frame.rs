@@ -349,8 +349,8 @@ pub(crate) trait FrameHeader {
 
 #[derive(Debug, PartialEq)]
 pub struct PushPromise {
-    id: u64,
-    encoded: Bytes,
+    pub(crate) id: u64,
+    pub(crate) encoded: Bytes,
 }
 
 impl FrameHeader for PushPromise {

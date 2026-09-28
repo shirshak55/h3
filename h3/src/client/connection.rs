@@ -442,6 +442,14 @@ where
         self.inner.shutdown(&mut self.sent_closing, PushId(0)).await
     }
 
+    /// The first 16 pushes the server made after this client sent MAX_PUSH_ID
+    /// ([`super::Builder::control_frames`]): promises (answered with CANCEL_PUSH), push streams
+    /// (stopped with H3_REQUEST_CANCELLED) and the server's CANCEL_PUSH frames. Pushes are not
+    /// delivered.
+    pub fn pushes(&self) -> Vec<crate::ext::PushEvent> {
+        self.inner.shared.pushes()
+    }
+
     /// How the server used its QPACK encoder stream so far. `None` unless this client
     /// advertises a dynamic table, as the encoder stream is only read then.
     pub fn peer_qpack_encoder(&self) -> Option<crate::ext::QpackEncoderUse> {
@@ -482,6 +490,15 @@ where
                     #[cfg(feature = "tracing")]
                     trace!("Got settings");
                     ()
+                }
+
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+                //# The CANCEL_PUSH frame (type=0x03) is used to request cancellation of
+                //# a server push prior to the push stream being received.
+                Ok(Frame::CancelPush(push_id)) if self.inner.shared.accepts_pushes() => {
+                    self.inner
+                        .shared
+                        .record_push(crate::ext::PushEvent::Cancelled { push_id: push_id.0 });
                 }
 
                 Ok(Frame::Goaway(id)) => {

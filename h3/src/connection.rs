@@ -23,7 +23,7 @@ use crate::{
         internal_error::{ErrorOrigin, InternalConnectionError},
         Code, ConnectionError, StreamError,
     },
-    ext::{ControlFrame, HeaderOrder},
+    ext::{ControlFrame, HeaderOrder, PushEvent},
     frame::{FrameStream, FrameStreamError},
     proto::{
         coding::Encode,
@@ -379,6 +379,19 @@ where
                 usize::try_from(settings.qpack_blocked_streams).unwrap_or(usize::MAX),
             );
         }
+        if let Some(max_push_id) =
+            conn_inner
+                .config
+                .control_frames
+                .iter()
+                .rev()
+                .find_map(|f| match f {
+                    ControlFrame::MaxPushId(id) => Some(*id),
+                    _ => None,
+                })
+        {
+            conn_inner.shared.set_max_push_id(max_push_id);
+        }
         if conn_inner.qpack_encoding {
             let capacity = conn_inner.config.qpack_encoder_capacity;
             conn_inner
@@ -546,6 +559,19 @@ where
                             "got two decoder streams".to_string(),
                         )));
                     }
+                }
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+                //# The
+                //# client SHOULD abort reading the stream with an error code of
+                //# H3_REQUEST_CANCELLED.
+                AcceptedRecvStream::Push(push_id, mut stream) if self.shared.accepts_pushes() => {
+                    let id = stream.id();
+                    stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+                    self.shared.qpack().cancel_stream(id.into_inner());
+                    self.shared.record_push(PushEvent::Stream {
+                        push_id,
+                        stream: id,
+                    });
                 }
                 AcceptedRecvStream::WebTransportUni(id, s)
                     if self.config.settings.enable_webtransport =>
@@ -1111,6 +1137,8 @@ pub struct RequestStream<S, B> {
     send_grease_frame: bool,
     /// Cancels the stream's QPACK references unless it is read to its end
     pub(crate) qpack_end: Option<QpackStreamEnd>,
+    /// A PUSH_PROMISE (push ID, field section) being decoded
+    promise: Option<(u64, Bytes)>,
 }
 
 impl<S, B> RequestStream<S, B> {
@@ -1128,6 +1156,7 @@ impl<S, B> RequestStream<S, B> {
             trailers: None,
             send_grease_frame: grease,
             qpack_end: None,
+            promise: None,
         }
     }
 
@@ -1162,6 +1191,63 @@ impl<S, B> RequestStream<S, B>
 where
     S: quic::RecvStream,
 {
+    /// The next frame. When this client sent MAX_PUSH_ID, a PUSH_PROMISE is decoded instead
+    /// (acknowledging its QPACK references), recorded and cancelled.
+    pub(crate) fn poll_next_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Frame<PayloadLen>>, StreamError>> {
+        loop {
+            if let Some((push_id, encoded)) = &self.promise {
+                let stream = self.stream.id();
+                let decoded = ready!(self.conn_state.poll_decode(
+                    cx,
+                    stream.into_inner(),
+                    encoded,
+                    self.max_field_section_size,
+                ));
+                let push_id = *push_id;
+                self.promise = None;
+                let fields = match decoded {
+                    Ok(decoded) => decoded.fields,
+                    Err(qpack::DecoderError::HeaderTooLong(_)) => Vec::new(),
+                    Err(_) => {
+                        return Poll::Ready(Err(self.handle_connection_error_on_stream(
+                            InternalConnectionError::new(
+                                Code::QPACK_DECOMPRESSION_FAILED,
+                                "Failed to decode a push promise".to_string(),
+                            ),
+                        )));
+                    }
+                };
+                self.conn_state.record_push(PushEvent::Promise {
+                    push_id,
+                    stream,
+                    fields: fields
+                        .into_iter()
+                        .map(|field| {
+                            let (name, value) = field.into_inner();
+                            (
+                                Bytes::from(name.into_owned()),
+                                Bytes::from(value.into_owned()),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+
+            match ready!(self.stream.poll_next(cx)) {
+                Ok(Some(Frame::PushPromise(promise))) if self.conn_state.accepts_pushes() => {
+                    self.promise = Some((promise.id, promise.encoded));
+                }
+                Ok(frame) => return Poll::Ready(Ok(frame)),
+                Err(e) => {
+                    return Poll::Ready(Err(self.handle_frame_stream_error_on_request_stream(e)))
+                }
+            }
+        }
+    }
+
     /// Receive some of the request body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_recv_data(
@@ -1169,12 +1255,8 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, StreamError>> {
         if !self.stream.has_data() {
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(
-                        self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
-                }
+            match ready!(self.poll_next_frame(cx)) {
+                Err(error) => return Poll::Ready(Err(error)),
                 Ok(None) => {
                     self.ended();
                     return Poll::Ready(Ok(None));
@@ -1244,12 +1326,8 @@ where
         let trailers = if let Some(encoded) = self.trailers.take() {
             encoded
         } else {
-            match ready!(self.stream.poll_next(cx)) {
-                Err(frame_stream_error) => {
-                    return Poll::Ready(Err(
-                        self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
-                }
+            match ready!(self.poll_next_frame(cx)) {
+                Err(error) => return Poll::Ready(Err(error)),
                 Ok(None) => {
                     self.ended();
                     return Poll::Ready(Ok(None));
@@ -1295,12 +1373,8 @@ where
             //# Receipt of an invalid sequence of frames MUST be treated as a
             //# connection error of type H3_FRAME_UNEXPECTED.
 
-            match self.stream.poll_next(cx) {
-                Poll::Ready(Err(frame_stream_error)) => {
-                    return Poll::Ready(Err(
-                        self.handle_frame_stream_error_on_request_stream(frame_stream_error)
-                    ))
-                }
+            match self.poll_next_frame(cx) {
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Ready(Ok(Some(trailing_frame))) => {
                     // Received a known frame after trailers -> fail.
                     return Poll::Ready(Err(self.handle_connection_error_on_stream(
@@ -1514,6 +1588,7 @@ where
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
                 qpack_end: None,
+                promise: None,
             },
             RequestStream {
                 stream: recv,
@@ -1522,6 +1597,7 @@ where
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
                 qpack_end: self.qpack_end,
+                promise: self.promise,
             },
         )
     }

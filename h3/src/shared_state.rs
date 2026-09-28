@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Cow,
+    collections::HashSet,
     sync::{atomic::AtomicBool, Mutex, MutexGuard, OnceLock},
     task::{Context, Poll},
 };
@@ -31,6 +32,10 @@ pub struct SharedState {
     qpack: Mutex<QpackState>,
     /// Control-stream frames waiting for the connection driver to write them
     control_out: Mutex<BytesMut>,
+    /// The MAX_PUSH_ID this client sent: it tolerates pushes, cancelling them
+    max_push_id: OnceLock<u64>,
+    /// The first pushes seen, and the push IDs promised or pushed
+    pushes: Mutex<(Vec<crate::ext::PushEvent>, HashSet<u64>)>,
 }
 
 impl Default for SharedState {
@@ -42,6 +47,8 @@ impl Default for SharedState {
             waker: AtomicWaker::new(),
             qpack: Mutex::new(QpackState::default()),
             control_out: Mutex::new(BytesMut::new()),
+            max_push_id: OnceLock::new(),
+            pushes: Mutex::new((Vec::new(), HashSet::new())),
         }
     }
 }
@@ -57,6 +64,46 @@ impl SharedState {
     pub(crate) fn send_control_frame(&self, frame: &crate::ext::ControlFrame) {
         frame.encode(&mut *self.control_out());
         self.waker.wake();
+    }
+
+    pub(crate) fn set_max_push_id(&self, max_push_id: u64) {
+        let _ = self.max_push_id.set(max_push_id);
+    }
+
+    /// Whether this client sent MAX_PUSH_ID, so it tolerates pushes
+    pub(crate) fn accepts_pushes(&self) -> bool {
+        self.max_push_id.get().is_some()
+    }
+
+    fn pushes_lock(&self) -> MutexGuard<'_, (Vec<crate::ext::PushEvent>, HashSet<u64>)> {
+        self.pushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records a push the client saw (the first 16), sending CANCEL_PUSH for a promise whose
+    /// push stream has not arrived.
+    pub(crate) fn record_push(&self, event: crate::ext::PushEvent) {
+        let mut pushes = self.pushes_lock();
+        match event {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+            //# A client SHOULD NOT send a CANCEL_PUSH frame
+            //# when it has already received a corresponding push stream.
+            crate::ext::PushEvent::Promise { push_id, .. } if pushes.1.insert(push_id) => {
+                self.send_control_frame(&crate::ext::ControlFrame::CancelPush(push_id));
+            }
+            crate::ext::PushEvent::Stream { push_id, .. } => {
+                pushes.1.insert(push_id);
+            }
+            _ => (),
+        }
+        if pushes.0.len() < 16 {
+            pushes.0.push(event);
+        }
+    }
+
+    pub(crate) fn pushes(&self) -> Vec<crate::ext::PushEvent> {
+        self.pushes_lock().0.clone()
     }
 
     pub(crate) fn qpack(&self) -> MutexGuard<'_, QpackState> {

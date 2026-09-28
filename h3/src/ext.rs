@@ -5,7 +5,10 @@ use std::str::FromStr;
 use bytes::{Buf, BufMut, Bytes};
 use http::HeaderName;
 
-use crate::proto::varint::{BufExt, BufMutExt, VarInt};
+use crate::{
+    proto::varint::{BufExt, BufMutExt, VarInt},
+    quic::StreamId,
+};
 
 /// Describes the `:protocol` pseudo-header for extended connect
 ///
@@ -195,4 +198,32 @@ impl ControlFrame {
         buf.write_var(payload.len() as u64);
         buf.put_slice(&payload);
     }
+}
+
+/// A server push a client that sent MAX_PUSH_ID saw, and cancelled
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PushEvent {
+    /// A PUSH_PROMISE on the request stream `stream`, with the promised request's field lines
+    /// (name, value) in order. The client answered with CANCEL_PUSH.
+    Promise {
+        /// The push ID
+        push_id: u64,
+        /// The request stream the promise came on
+        stream: StreamId,
+        /// The promised request's field lines
+        fields: Vec<(Bytes, Bytes)>,
+    },
+    /// A push stream, which the client stopped reading (STOP_SENDING H3_REQUEST_CANCELLED)
+    Stream {
+        /// The push ID
+        push_id: u64,
+        /// The push stream
+        stream: StreamId,
+    },
+    /// A CANCEL_PUSH from the server
+    Cancelled {
+        /// The push ID
+        push_id: u64,
+    },
 }
