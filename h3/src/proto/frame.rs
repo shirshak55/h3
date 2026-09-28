@@ -330,6 +330,10 @@ impl FrameType {
         buf.write_var(self.0);
     }
 
+    pub(crate) fn value(self) -> u64 {
+        self.0
+    }
+
     #[cfg(test)]
     pub(crate) const RESERVED: FrameType = FrameType(0x1f * 1337 + 0x21);
 }

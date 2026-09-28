@@ -1,6 +1,6 @@
 use std::task::{Context, Poll};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 
 #[cfg(feature = "tracing")]
 use tracing::trace;
@@ -50,6 +50,16 @@ impl<S, B> FrameStream<S, B> {
 
     pub fn frame_types(&self) -> &[u64] {
         &self.decoder.frame_types
+    }
+
+    /// Keeps each frame read, unknown ones included, for [`FrameStream::take_frames`].
+    pub(crate) fn keep_frames(&mut self) {
+        self.decoder.keep_frames = true;
+    }
+
+    /// The frames read since the last call: type, payload length and the first payload bytes.
+    pub(crate) fn take_frames(&mut self) -> Vec<(u64, u64, Bytes)> {
+        std::mem::take(&mut self.decoder.frames)
     }
 }
 
@@ -217,6 +227,8 @@ pub struct FrameDecoder {
     expected: Option<usize>,
     record_limit: usize,
     frame_types: Vec<u64>,
+    keep_frames: bool,
+    frames: Vec<(u64, u64, Bytes)>,
 }
 
 impl FrameDecoder {
@@ -248,6 +260,19 @@ impl FrameDecoder {
             {
                 let ty = src.cursor().get_var().expect("a decoded frame has a type");
                 self.frame_types.push(ty);
+            }
+
+            if self.keep_frames
+                && matches!(decoded, Ok(_) | Err(frame::FrameError::UnknownFrame(_)))
+            {
+                let mut frame = src.cursor();
+                let ty = frame.get_var().expect("a decoded frame has a type");
+                let len = frame.get_var().expect("a decoded frame has a length");
+                let kept = frame
+                    .remaining()
+                    .min(len as usize)
+                    .min(crate::ext::CONTROL_PAYLOAD_RECORD_LIMIT);
+                self.frames.push((ty, len, frame.copy_to_bytes(kept)));
             }
 
             match decoded {

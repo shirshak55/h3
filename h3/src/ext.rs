@@ -2,7 +2,10 @@
 
 use std::str::FromStr;
 
+use bytes::{Buf, Bytes};
 use http::HeaderName;
+
+use crate::proto::varint::BufExt;
 
 /// Describes the `:protocol` pseudo-header for extended connect
 ///
@@ -87,4 +90,64 @@ pub struct QpackEncoderUse {
     pub dynamic_sections: u64,
     /// Field sections that waited for encoder-stream instructions (blocked streams)
     pub blocked_sections: u64,
+}
+
+/// A frame on a control stream after SETTINGS, as recorded from the peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlFrame {
+    /// PRIORITY_UPDATE (RFC 9218) for a request stream (type 0xf0700) or, with `push`, a push
+    /// (0xf0701): the prioritized element's ID and its Priority Field Value
+    PriorityUpdate {
+        /// The frame is the push variant (0xf0701)
+        push: bool,
+        /// The Prioritized Element ID: a request stream ID or a push ID
+        id: u64,
+        /// The Priority Field Value, e.g. `u=0, i`
+        priority: Bytes,
+    },
+    /// MAX_PUSH_ID
+    MaxPushId(u64),
+    /// CANCEL_PUSH
+    CancelPush(u64),
+    /// GOAWAY
+    Goaway(u64),
+    /// A frame of a reserved (GREASE) or other unknown type with a `len`-byte payload, the
+    /// first 256 bytes of which are kept in `payload`.
+    Other {
+        /// The frame type
+        ty: u64,
+        /// The payload length
+        len: u64,
+        /// The payload, or its first bytes
+        payload: Bytes,
+    },
+}
+
+/// How many payload bytes of an unknown control frame are recorded
+pub(crate) const CONTROL_PAYLOAD_RECORD_LIMIT: usize = 256;
+
+impl ControlFrame {
+    pub(crate) const PRIORITY_UPDATE_REQUEST: u64 = 0xf0700;
+    pub(crate) const PRIORITY_UPDATE_PUSH: u64 = 0xf0701;
+
+    /// The frame of type `ty` with a `len`-byte payload beginning with `payload`
+    pub(crate) fn parse(ty: u64, len: u64, payload: Bytes) -> Self {
+        let whole = payload.len() as u64 == len;
+        let mut buf = payload.clone();
+        let id = buf.get_var().ok().filter(|_| whole);
+        match (ty, id) {
+            (Self::PRIORITY_UPDATE_REQUEST | Self::PRIORITY_UPDATE_PUSH, Some(id)) => {
+                Self::PriorityUpdate {
+                    push: ty == Self::PRIORITY_UPDATE_PUSH,
+                    id,
+                    priority: buf,
+                }
+            }
+            (0xd, Some(id)) if !buf.has_remaining() => Self::MaxPushId(id),
+            (0x3, Some(id)) if !buf.has_remaining() => Self::CancelPush(id),
+            (0x7, Some(id)) if !buf.has_remaining() => Self::Goaway(id),
+            _ => Self::Other { ty, len, payload },
+        }
+    }
 }

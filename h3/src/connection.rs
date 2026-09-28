@@ -9,6 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{future, ready};
 use http::{HeaderMap, HeaderName};
 use stream::WriteBuf;
+use tokio::sync::mpsc;
 
 #[cfg(feature = "tracing")]
 use tracing::{instrument, warn};
@@ -22,7 +23,7 @@ use crate::{
         internal_error::{ErrorOrigin, InternalConnectionError},
         Code, ConnectionError, StreamError,
     },
-    ext::HeaderOrder,
+    ext::{ControlFrame, HeaderOrder},
     frame::{FrameStream, FrameStreamError},
     proto::{
         coding::Encode,
@@ -110,6 +111,10 @@ where
     got_peer_settings: bool,
     peer_settings: Option<Vec<(u64, u64)>>,
     peer_uni_streams: Vec<(StreamId, u64)>,
+    /// The first frames after SETTINGS on the peer's control stream
+    peer_control_frames: Vec<ControlFrame>,
+    /// Receives every frame after SETTINGS on the peer's control stream
+    control_frames_tx: Option<mpsc::UnboundedSender<ControlFrame>>,
     /// Decoding with a QPACK dynamic table: the peer's encoder stream is read
     qpack_decoding: bool,
     /// Decoder-stream instructions being written
@@ -339,6 +344,8 @@ where
             got_peer_settings: false,
             peer_settings: None,
             peer_uni_streams: Vec::new(),
+            peer_control_frames: Vec::new(),
+            control_frames_tx: None,
             qpack_decoding: config.settings.qpack_max_table_capacity > 0,
             decoder_queue: Queued::default(),
             qpack_encoding: config.qpack_encoder_capacity > 0,
@@ -500,6 +507,7 @@ where
                         )));
                     }
                     s.record_frame_types(PEER_RECORD_LIMIT);
+                    s.keep_frames();
                     self.control_recv = Some(s);
                 }
                 enc @ AcceptedRecvStream::Encoder(_) => {
@@ -579,7 +587,21 @@ where
             }
         };
 
-        let res = match ready!(recv.poll_next(cx)) {
+        let polled = recv.poll_next(cx);
+        for (ty, len, payload) in recv.take_frames() {
+            if ty == frame::FrameType::SETTINGS.value() {
+                continue;
+            }
+            let frame = ControlFrame::parse(ty, len, payload);
+            if let Some(tx) = &self.control_frames_tx {
+                let _ = tx.send(frame.clone());
+            }
+            if self.peer_control_frames.len() < PEER_RECORD_LIMIT {
+                self.peer_control_frames.push(frame);
+            }
+        }
+
+        let res = match ready!(polled) {
             Err(FrameStreamError::Quic(StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error,
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
@@ -1032,6 +1054,19 @@ where
         self.control_recv
             .as_ref()
             .map_or(&[], |control| control.frame_types())
+    }
+
+    /// The first frames after SETTINGS on the peer's control stream, in wire order.
+    pub fn peer_control_frames(&self) -> &[ControlFrame] {
+        &self.peer_control_frames
+    }
+
+    /// Receives every frame after SETTINGS on the peer's control stream as it is read from now
+    /// on, replacing any previous receiver.
+    pub fn subscribe_control_frames(&mut self) -> mpsc::UnboundedReceiver<ControlFrame> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.control_frames_tx = Some(tx);
+        rx
     }
 }
 

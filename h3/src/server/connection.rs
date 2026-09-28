@@ -176,6 +176,22 @@ where
         self.inner.peer_control_frame_types()
     }
 
+    /// The first 16 frames after SETTINGS on the client's control stream, in wire order and
+    /// with their contents: PRIORITY_UPDATE (request and push variants), MAX_PUSH_ID,
+    /// CANCEL_PUSH, GOAWAY and reserved (GREASE) or other unknown frames.
+    pub fn peer_control_frames(&self) -> &[crate::ext::ControlFrame] {
+        self.inner.peer_control_frames()
+    }
+
+    /// Receives every frame after SETTINGS on the client's control stream as
+    /// [`Connection::accept`] reads it, from now on (a PRIORITY_UPDATE when it arrives, for
+    /// one), replacing any previous receiver. Frames are buffered until received.
+    pub fn subscribe_control_frames(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::ext::ControlFrame> {
+        self.inner.subscribe_control_frames()
+    }
+
     /// How the client used its QPACK encoder stream so far: the dynamic table capacities it set,
     /// its inserts, and the field sections that referenced the table or waited for it. `None`
     /// unless this server advertises a dynamic table ([`super::Builder::qpack_max_table_capacity`]),
