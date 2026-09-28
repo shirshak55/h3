@@ -167,6 +167,9 @@ where
             });
         }
 
+        // The grease frame goes ahead of the response, not last: a client (aioquic) that
+        // ignores an unknown frame type also misses the end of a stream it ends.
+        self.inner.send_grease().await?;
         stream::write(&mut self.inner.stream, Frame::Headers(block.freeze()))
             .await
             .map_err(|e| self.handle_quic_stream_error(e))?;

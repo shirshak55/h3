@@ -1129,6 +1129,15 @@ where
     #[allow(missing_docs)]
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn finish(&mut self) -> Result<(), StreamError> {
+        self.send_grease().await?;
+
+        future::poll_fn(|cx| self.stream.poll_finish(cx))
+            .await
+            .map_err(|e| self.handle_quic_stream_error(e))
+    }
+
+    /// Sends the connection's grease frame, if this stream still owes it.
+    pub(crate) async fn send_grease(&mut self) -> Result<(), StreamError> {
         if self.send_grease_frame {
             // send a grease frame once per Connection
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
@@ -1142,10 +1151,7 @@ where
                 .map_err(|e| self.handle_quic_stream_error(e))?;
             self.send_grease_frame = false;
         }
-
-        future::poll_fn(|cx| self.stream.poll_finish(cx))
-            .await
-            .map_err(|e| self.handle_quic_stream_error(e))
+        Ok(())
     }
 }
 
