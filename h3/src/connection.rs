@@ -234,20 +234,23 @@ where
         let mut encoder_send = Option::take(&mut self.qpack_streams.encoder_send);
         let lazy = self.config.qpack_lazy_stream_types;
 
-        let (control, ..) = future::join3(
-            stream::write_encoded(&mut self.control_send, &control_header),
-            async {
-                if let Some(stream) = decoder_send.as_mut().filter(|_| !lazy) {
-                    let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Decoder)).await;
-                }
-            },
-            async {
-                if let Some(stream) = encoder_send.as_mut().filter(|_| !lazy) {
-                    let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Encoder)).await;
-                }
-            },
-        )
-        .await;
+        let control = stream::write_encoded(&mut self.control_send, &control_header);
+        let decoder = async {
+            if let Some(stream) = decoder_send.as_mut().filter(|_| !lazy) {
+                let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Decoder)).await;
+            }
+        };
+        let encoder = async {
+            if let Some(stream) = encoder_send.as_mut().filter(|_| !lazy) {
+                let _ = stream::write(stream, WriteBuf::from(UniStreamHeader::Encoder)).await;
+            }
+        };
+        // The QPACK streams' types go out in the order the streams were opened.
+        let control = if self.config.qpack_decoder_stream_first {
+            future::join3(control, decoder, encoder).await.0
+        } else {
+            future::join3(control, encoder, decoder).await.0
+        };
 
         self.qpack_streams.decoder_send = decoder_send;
         self.qpack_streams.encoder_send = encoder_send;
