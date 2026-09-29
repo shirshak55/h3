@@ -165,6 +165,12 @@ where
         };
 
         let qpack::Decoded { fields, .. } = decoded;
+        // Pseudo-header names (`:status`) aren't header names, so this lists the regular
+        // fields.
+        let order = fields
+            .iter()
+            .filter_map(|field| http::HeaderName::from_bytes(&field.name).ok())
+            .collect();
 
         let (status, headers) = Header::try_from(fields)
             .map_err(|_e| {
@@ -186,6 +192,7 @@ where
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
         *resp.version_mut() = http::Version::HTTP_3;
+        resp.extensions_mut().insert(crate::ext::HeaderOrder(order));
 
         Ok(resp)
     }
@@ -222,6 +229,18 @@ where
             if let StreamError::HeaderTooBig { .. } = e {
                 self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
             }
+        }
+        res
+    }
+
+    /// [`RequestStream::poll_recv_trailers`], with the trailer fields' order.
+    pub fn poll_recv_trailers_with_order(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<(HeaderMap, crate::ext::HeaderOrder)>, StreamError>> {
+        let res = self.inner.poll_recv_trailers_with_order(cx);
+        if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
+            self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
         }
         res
     }
