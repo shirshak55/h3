@@ -285,6 +285,18 @@ where
         self.inner.send_trailers(trailers).await
     }
 
+    /// Send a set of trailers to end the request, their fields in `order`.
+    ///
+    /// [`RequestStream::finish()`] must be called to finalize a request.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn send_trailers_with_order(
+        &mut self,
+        trailers: HeaderMap,
+        order: crate::ext::HeaderOrder,
+    ) -> Result<(), StreamError> {
+        self.inner.send_trailers_with_order(trailers, order).await
+    }
+
     /// End the request without trailers.
     ///
     /// [`RequestStream::finish()`] must be called to finalize a request.
