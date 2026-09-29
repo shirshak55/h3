@@ -115,6 +115,13 @@ where
     pub fn id(&self) -> StreamId {
         self.inner.stream.id()
     }
+
+    /// How the client used its QPACK encoder stream so far (see
+    /// [`crate::server::Connection::peer_qpack_encoder`]): once this request's headers are
+    /// decoded, the inserts they referenced included.
+    pub fn peer_qpack_encoder(&self) -> Option<crate::ext::QpackEncoderUse> {
+        self.inner.conn_state.qpack().encoder_use()
+    }
 }
 
 impl<S, B> RequestStream<S, B>
