@@ -3,8 +3,11 @@
 use std::{
     borrow::Cow,
     collections::HashSet,
-    sync::{atomic::AtomicBool, Mutex, MutexGuard, OnceLock},
-    task::{Context, Poll},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard, OnceLock,
+    },
+    task::{Context, Poll, Waker},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -32,6 +35,10 @@ pub struct SharedState {
     qpack: Mutex<QpackState>,
     /// Control-stream frames waiting for the connection driver to write them
     control_out: Mutex<BytesMut>,
+    /// Whether the driver holds control-stream frames the transport has not taken yet
+    control_in_flight: AtomicBool,
+    /// Tasks waiting for the control-stream frames queued so far to reach the transport
+    control_written: Mutex<Vec<Waker>>,
     /// The MAX_PUSH_ID this client sent: it tolerates pushes, cancelling them
     max_push_id: OnceLock<u64>,
     /// The first pushes seen, and the push IDs promised or pushed
@@ -47,6 +54,8 @@ impl Default for SharedState {
             waker: AtomicWaker::new(),
             qpack: Mutex::new(QpackState::default()),
             control_out: Mutex::new(BytesMut::new()),
+            control_in_flight: AtomicBool::new(false),
+            control_written: Mutex::new(Vec::new()),
             max_push_id: OnceLock::new(),
             pushes: Mutex::new((Vec::new(), HashSet::new())),
         }
@@ -64,6 +73,37 @@ impl SharedState {
     pub(crate) fn send_control_frame(&self, frame: &crate::ext::ControlFrame) {
         frame.encode(&mut *self.control_out());
         self.waker.wake();
+    }
+
+    /// Records whether the driver holds control-stream frames the transport has not taken
+    /// yet, waking the tasks waiting for them once it holds none.
+    pub(crate) fn set_control_in_flight(&self, in_flight: bool) {
+        self.control_in_flight.store(in_flight, Ordering::Release);
+        if !in_flight {
+            let wakers = std::mem::take(&mut *self.control_written_lock());
+            for waker in wakers {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Resolves once the control-stream frames queued so far reached the transport, so a
+    /// frame written to another stream after it goes out after them.
+    pub(crate) fn poll_control_written(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut wakers = self.control_written_lock();
+        if self.control_out().is_empty() && !self.control_in_flight.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+            wakers.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+
+    fn control_written_lock(&self) -> MutexGuard<'_, Vec<Waker>> {
+        self.control_written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn set_max_push_id(&self, max_push_id: u64) {

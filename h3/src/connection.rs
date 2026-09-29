@@ -924,7 +924,14 @@ where
         self.control_queue.data.extend_from_slice(&out);
         match self.control_queue.poll_write(&mut self.control_send, cx) {
             Poll::Ready(Err(e)) => Err(self.critical_stream_error(e, "control")),
-            _ => Ok(()),
+            Poll::Ready(Ok(())) => {
+                self.shared.set_control_in_flight(false);
+                Ok(())
+            }
+            Poll::Pending => {
+                self.shared.set_control_in_flight(true);
+                Ok(())
+            }
         }
     }
 

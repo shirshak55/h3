@@ -282,6 +282,13 @@ where
             });
         Ok(())
     }
+
+    /// Resolves once the control-stream frames queued so far (a
+    /// [`send_priority_update`](Self::send_priority_update)) reached the transport, so a
+    /// request sent after it goes out after them.
+    pub async fn control_written(&self) {
+        future::poll_fn(|cx| self.conn_state.poll_control_written(cx)).await
+    }
 }
 
 impl<T, B> Clone for SendRequest<T, B>
