@@ -9,3 +9,9 @@ members = [
     "examples",
 ]
 resolver = "2"
+
+# h3-quinn reads with the quinn fork's public RecvStream::poll_read_chunk.
+[patch.crates-io]
+quinn = { git = "https://github.com/shirshak55/quinn", branch = "wiremason" }
+quinn-proto = { git = "https://github.com/shirshak55/quinn", branch = "wiremason" }
+quinn-udp = { git = "https://github.com/shirshak55/quinn", branch = "wiremason" }
