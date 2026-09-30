@@ -199,6 +199,16 @@ impl Builder {
         self
     }
 
+    /// Hold back the control stream's SETTINGS and frames, the QPACK streams' types and the
+    /// reserved stream until [`Connection::start`], as from a client whose SETTINGS arrive
+    /// after its first request: requests can be sent at once, their field sections encoded
+    /// without the QPACK dynamic table, and responses are decoded without one until then. The
+    /// streams are opened (taking their IDs) at once.
+    pub fn defer_settings(&mut self, enabled: bool) -> &mut Self {
+        self.config.defer_settings = enabled;
+        self
+    }
+
     /// Indicates that the client supports HTTP/3 datagrams
     ///
     /// See: <https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1>
@@ -211,6 +221,15 @@ impl Builder {
     pub fn enable_extended_connect(&mut self, value: bool) -> &mut Self {
         self.config.settings.enable_extended_connect = value;
         self
+    }
+
+    /// The configuration, its settings taken from the raw SETTINGS when given
+    pub(super) fn config(&self) -> Config {
+        let mut config = self.config.clone();
+        if let Some(raw) = &config.raw_settings {
+            config.settings = raw.into();
+        }
+        config
     }
 
     /// Create a new HTTP/3 client from a `quic` connection
@@ -228,12 +247,7 @@ impl Builder {
 
         let conn_state = Arc::new(shared);
 
-        let mut config = self.config.clone();
-        if let Some(raw) = &config.raw_settings {
-            config.settings = raw.into();
-        }
-
-        let inner = ConnectionInner::new(quic, conn_state.clone(), config).await?;
+        let inner = ConnectionInner::new(quic, conn_state.clone(), self.config()).await?;
         let send_request = SendRequest {
             open,
             conn_state,

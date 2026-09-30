@@ -463,6 +463,16 @@ where
         self.inner.peer_qpack_encoder()
     }
 
+    /// Sends what a connection built with [`Builder::defer_settings`] held back, as `builder`
+    /// configures it in place of the builder it was built with: the SETTINGS and control
+    /// frames, the QPACK streams' types and dynamic table use, and the reserved stream. Does
+    /// nothing on a connection that sent them already.
+    ///
+    /// [`Builder::defer_settings`]: super::Builder::defer_settings
+    pub async fn start(&mut self, builder: &super::Builder) -> Result<(), ConnectionError> {
+        self.inner.start(builder.config()).await
+    }
+
     /// Wait until the connection is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn wait_idle(&mut self) -> ConnectionError {

@@ -24,6 +24,8 @@ pub struct Config {
     pub(crate) qpack_lazy_stream_types: bool,
     /// Frames sent on the control stream after SETTINGS
     pub(crate) control_frames: Vec<crate::ext::ControlFrame>,
+    /// Hold back SETTINGS and the rest written on the unidirectional streams until started
+    pub(crate) defer_settings: bool,
 
     #[cfg(test)]
     pub(crate) send_settings: bool,
@@ -107,6 +109,7 @@ impl TryFrom<Config> for frame::Settings {
             qpack_decoder_stream_first: _,
             qpack_lazy_stream_types: _,
             control_frames: _,
+            defer_settings: _,
             #[cfg(test)]
                 send_settings: _,
             settings:
@@ -239,6 +242,7 @@ impl Default for Config {
             qpack_decoder_stream_first: false,
             qpack_lazy_stream_types: false,
             control_frames: Vec::new(),
+            defer_settings: false,
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),

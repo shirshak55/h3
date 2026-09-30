@@ -128,6 +128,9 @@ where
     encoder_typed: bool,
     /// Control-stream frames being written after SETTINGS
     control_queue: Queued,
+    /// SETTINGS and the rest written on the unidirectional streams are held back until
+    /// [`Self::start`]
+    deferred: bool,
     pub(crate) handled_connection_error: Option<ConnectionError>,
     pub send_grease_frame: bool,
     // tells if the grease steam should be sent
@@ -367,6 +370,7 @@ where
             decoder_typed: !config.qpack_lazy_stream_types,
             encoder_typed: !config.qpack_lazy_stream_types,
             control_queue: Queued::default(),
+            deferred: config.defer_settings,
             send_grease_frame: config.send_grease_frame,
             // send grease stream if configured
             send_grease_stream_flag: config.send_grease_stream,
@@ -375,36 +379,77 @@ where
             // start at first step
             grease_step: GreaseStatus::NotStarted(PhantomData),
         };
-        if conn_inner.qpack_decoding {
-            let settings = &conn_inner.config.settings;
-            conn_inner.shared.qpack().enable_decoding(
+        conn_inner.apply_config();
+        if !conn_inner.deferred {
+            conn_inner.send_control_stream_headers().await?;
+        }
+
+        Ok(conn_inner)
+    }
+
+    /// Sets up the QPACK dynamic table use and the pushes tolerated as the configuration says
+    fn apply_config(&mut self) {
+        if self.qpack_decoding {
+            let settings = &self.config.settings;
+            self.shared.qpack().enable_decoding(
                 usize::try_from(settings.qpack_max_table_capacity).unwrap_or(usize::MAX),
                 usize::try_from(settings.qpack_blocked_streams).unwrap_or(usize::MAX),
             );
         }
-        if let Some(max_push_id) =
-            conn_inner
-                .config
-                .control_frames
-                .iter()
-                .rev()
-                .find_map(|f| match f {
-                    ControlFrame::MaxPushId(id) => Some(*id),
-                    _ => None,
-                })
+        if let Some(max_push_id) = self
+            .config
+            .control_frames
+            .iter()
+            .rev()
+            .find_map(|f| match f {
+                ControlFrame::MaxPushId(id) => Some(*id),
+                _ => None,
+            })
         {
-            conn_inner.shared.set_max_push_id(max_push_id);
+            self.shared.set_max_push_id(max_push_id);
         }
-        if conn_inner.qpack_encoding {
-            let capacity = conn_inner.config.qpack_encoder_capacity;
-            conn_inner
-                .shared
+        if self.qpack_encoding {
+            let capacity = self.config.qpack_encoder_capacity;
+            self.shared
                 .qpack()
                 .enable_encoding(usize::try_from(capacity).unwrap_or(usize::MAX));
         }
-        conn_inner.send_control_stream_headers().await?;
+    }
 
-        Ok(conn_inner)
+    /// Sends what [`Config::defer_settings`] held back, configured by `config` in place of the
+    /// connection's configuration: the SETTINGS and control frames, the QPACK streams' types
+    /// and dynamic table use, and the reserved stream. Does nothing once they were sent.
+    pub async fn start(&mut self, config: Config) -> Result<(), ConnectionError> {
+        if !self.deferred {
+            return Ok(());
+        }
+        self.deferred = false;
+        // The QPACK streams took their IDs in the order the connection was built with.
+        if config.qpack_decoder_stream_first != self.config.qpack_decoder_stream_first {
+            std::mem::swap(
+                &mut self.qpack_streams.decoder_send,
+                &mut self.qpack_streams.encoder_send,
+            );
+        }
+        self.qpack_decoding = config.settings.qpack_max_table_capacity > 0;
+        self.qpack_encoding = config.qpack_encoder_capacity > 0;
+        self.decoder_typed = !config.qpack_lazy_stream_types;
+        self.encoder_typed = !config.qpack_lazy_stream_types;
+        self.send_grease_frame = config.send_grease_frame;
+        self.send_grease_stream_flag = config.send_grease_stream;
+        self.config = config;
+        self.apply_config();
+        if self.qpack_encoding && self.got_peer_settings {
+            let peer = self.settings();
+            let (capacity, blocked) = (peer.qpack_max_table_capacity, peer.qpack_blocked_streams);
+            self.shared.qpack().on_peer_settings(capacity, blocked);
+        }
+        self.send_control_stream_headers().await?;
+        // Otherwise opened after the peer's next control frame, which may not come.
+        if self.send_grease_stream_flag {
+            future::poll_fn(|cx| self.poll_grease_stream(cx)).await;
+        }
+        Ok(())
     }
 
     /// Send GOAWAY with specified max_id, iff max_id is smaller than the previous one.
@@ -426,6 +471,10 @@ where
 
         *sent_closing = Some(max_id);
         self.set_closing();
+        // A GOAWAY can't go ahead of the SETTINGS held back.
+        if self.deferred {
+            return Ok(());
+        }
 
         // Frames queued for the control stream go first, and none may be half-written.
         let out = self.shared.control_out().split();
@@ -920,6 +969,10 @@ where
 
     /// Writes the control-stream frames streams queued.
     fn poll_control_send(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
+        // Queued frames wait for the SETTINGS held back to go ahead of them.
+        if self.deferred {
+            return Ok(());
+        }
         let out = self.shared.control_out().split();
         self.control_queue.data.extend_from_slice(&out);
         match self.control_queue.poll_write(&mut self.control_send, cx) {
