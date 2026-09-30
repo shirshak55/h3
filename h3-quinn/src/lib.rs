@@ -91,10 +91,14 @@ impl Connection {
     /// (see [`quinn::SendStream::stopped`]), so a server can cancel the work behind a
     /// request its client abandoned.
     pub fn with_stopped_hook(conn: quinn::Connection, hook: StoppedHook) -> Self {
-        Self {
-            stopped_hook: Some(hook),
-            ..Self::new(conn)
-        }
+        Self::new(conn).on_stopped(hook)
+    }
+
+    /// Calls `hook` with each bidirectional stream this connection accepts or opens (its
+    /// [`OpenStreams`] included), as [`Connection::with_stopped_hook`] does.
+    pub fn on_stopped(mut self, hook: StoppedHook) -> Self {
+        self.stopped_hook = Some(hook);
+        self
     }
 }
 
@@ -146,6 +150,7 @@ where
     fn opener(&self) -> Self::OpenStreams {
         OpenStreams {
             conn: self.conn.clone(),
+            stopped_hook: self.stopped_hook.clone(),
             opening_bi: None,
             opening_uni: None,
         }
@@ -194,6 +199,9 @@ where
             .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_connection_error(e),
             })?;
+        if let Some(hook) = &self.stopped_hook {
+            hook(send.id(), Box::pin(send.stopped()));
+        }
         Poll::Ready(Ok(Self::BidiStream {
             send: Self::SendStream::new(send),
             recv: RecvStream::new(recv),
@@ -234,6 +242,7 @@ where
 /// [`quinn::OpenBi`], [`quinn::OpenUni`].
 pub struct OpenStreams {
     conn: quinn::Connection,
+    stopped_hook: Option<StoppedHook>,
     opening_bi: Option<BoxStreamSync<'static, <OpenBi<'static> as Future>::Output>>,
     opening_uni: Option<BoxStreamSync<'static, <OpenUni<'static> as Future>::Output>>,
 }
@@ -261,6 +270,9 @@ where
             .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_connection_error(e),
             })?;
+        if let Some(hook) = &self.stopped_hook {
+            hook(send.id(), Box::pin(send.stopped()));
+        }
         Poll::Ready(Ok(Self::BidiStream {
             send: Self::SendStream::new(send),
             recv: RecvStream::new(recv),
@@ -299,6 +311,7 @@ impl Clone for OpenStreams {
     fn clone(&self) -> Self {
         Self {
             conn: self.conn.clone(),
+            stopped_hook: self.stopped_hook.clone(),
             opening_bi: None,
             opening_uni: None,
         }
