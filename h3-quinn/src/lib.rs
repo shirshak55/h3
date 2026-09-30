@@ -86,6 +86,26 @@ impl Connection {
         }
     }
 
+    /// For a connection sending early data: the peer's unidirectional streams are accepted
+    /// only once `accepted` resolves `true`, so those of a peer that rejected the early data
+    /// are left to the connection that replaces this one.
+    pub fn accepting_uni_after(
+        mut self,
+        accepted: impl Future<Output = bool> + Send + Sync + 'static,
+    ) -> Self {
+        let conn = self.conn.clone();
+        self.incoming_uni = Box::pin(stream::once(accepted).flat_map(move |accepted| {
+            stream::unfold(conn.clone(), move |conn| async move {
+                let incoming = match accepted {
+                    true => conn.accept_uni().await,
+                    false => Err(conn.closed().await),
+                };
+                Some((incoming, conn))
+            })
+        }));
+        self
+    }
+
     /// Like [`Connection::new`], calling `hook` with each accepted bidirectional
     /// stream's ID and a future resolving when the peer stops reading that stream
     /// (see [`quinn::SendStream::stopped`]), so a server can cancel the work behind a
@@ -458,7 +478,7 @@ fn convert_read_error_to_stream_error(error: ReadError) -> StreamErrorIncoming {
         }
         error @ ReadError::ClosedStream => StreamErrorIncoming::Unknown(Box::new(error)),
         ReadError::IllegalOrderedRead => panic!("h3-quinn only performs ordered reads"),
-        error @ ReadError::ZeroRttRejected => StreamErrorIncoming::Unknown(Box::new(error)),
+        error @ ReadError::ZeroRttRejected => zero_rtt_rejected(error),
     }
 }
 
@@ -472,9 +492,16 @@ fn convert_write_error_to_stream_error(error: quinn::WriteError) -> StreamErrorI
                 connection_error: convert_connection_error(connection_error),
             }
         }
-        error @ quinn::WriteError::ClosedStream | error @ quinn::WriteError::ZeroRttRejected => {
-            StreamErrorIncoming::Unknown(Box::new(error))
-        }
+        error @ quinn::WriteError::ClosedStream => StreamErrorIncoming::Unknown(Box::new(error)),
+        error @ quinn::WriteError::ZeroRttRejected => zero_rtt_rejected(error),
+    }
+}
+
+/// Early data the peer rejected ends the HTTP/3 connection sent in it, but not the QUIC
+/// connection, whose next HTTP/3 connection sends the requests again.
+fn zero_rtt_rejected(error: impl std::error::Error + Send + Sync + 'static) -> StreamErrorIncoming {
+    StreamErrorIncoming::ConnectionErrorIncoming {
+        connection_error: ConnectionErrorIncoming::Undefined(Arc::new(error)),
     }
 }
 
