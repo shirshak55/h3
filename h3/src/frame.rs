@@ -26,6 +26,8 @@ pub struct FrameStream<S, B> {
     // Already read data from the stream
     decoder: FrameDecoder,
     remaining_data: usize,
+    /// The stream's error, read while data was still buffered
+    error: Option<FrameStreamError>,
 }
 
 impl<S, B> FrameStream<S, B> {
@@ -34,6 +36,7 @@ impl<S, B> FrameStream<S, B> {
             stream,
             decoder: FrameDecoder::default(),
             remaining_data: 0,
+            error: None,
         }
     }
 
@@ -79,9 +82,9 @@ where
             "There is still data to read, please call poll_data() until it returns None."
         );
 
+        // A frame already buffered goes first: the stream's next read may be its reset
+        let mut end = Poll::Ready(false);
         loop {
-            let end = self.try_recv(cx)?;
-
             return match self.decoder.decode(self.stream.buf_mut())? {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
@@ -94,7 +97,10 @@ where
                 Some(frame) => Poll::Ready(Ok(Some(frame))),
                 None => match end {
                     // Received a chunk but frame is incomplete, poll until we get `Pending`.
-                    Poll::Ready(false) => continue,
+                    Poll::Ready(false) => {
+                        end = self.try_recv(cx)?;
+                        continue;
+                    }
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(true) => {
                         if self.stream.buf_mut().has_remaining() {
@@ -124,6 +130,11 @@ where
 
         let end = match self.try_recv(cx) {
             Poll::Ready(Ok(end)) => end,
+            // Data already buffered goes first: the stream's error, such as its reset, follows it
+            Poll::Ready(Err(e)) if self.stream.buf().has_remaining() => {
+                self.error = Some(e);
+                false
+            }
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => false,
         };
@@ -159,6 +170,9 @@ where
     }
 
     fn try_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool, FrameStreamError>> {
+        if let Some(error) = self.error.take() {
+            return Poll::Ready(Err(error));
+        }
         if self.stream.is_eos() {
             return Poll::Ready(Ok(true));
         }
@@ -212,11 +226,13 @@ where
                 stream: send,
                 decoder: FrameDecoder::default(),
                 remaining_data: 0,
+                error: None,
             },
             FrameStream {
                 stream: recv,
                 decoder: self.decoder,
                 remaining_data: self.remaining_data,
+                error: self.error,
             },
         )
     }
