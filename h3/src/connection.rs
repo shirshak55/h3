@@ -708,7 +708,7 @@ where
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
         //# A client MUST treat receipt of a push stream with a push ID that is greater than
         //# the maximum push ID as a connection error of type H3_ID_ERROR.
-        if self.shared.max_push_id().is_none_or(|max| push_id > max) {
+        if self.shared.max_push_id().map_or(true, |max| push_id > max) {
             return Err(self.handle_connection_error(InternalConnectionError::new(
                 Code::H3_ID_ERROR,
                 format!("push stream {id} with push ID {push_id} above MAX_PUSH_ID"),

@@ -229,7 +229,7 @@ impl SharedState {
         //# A client MUST treat
         //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
         //# the client has advertised as a connection error of H3_ID_ERROR.
-        if self.max_push_id().is_none_or(|max| push_id > max) {
+        if self.max_push_id().map_or(true, |max| push_id > max) {
             return Err(InternalConnectionError::new(
                 Code::H3_ID_ERROR,
                 format!("PUSH_PROMISE with push ID {push_id} above MAX_PUSH_ID"),
