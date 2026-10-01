@@ -777,8 +777,7 @@ where
                         ),
                         _ => {
                             let (arrived, awaited) = oneshot::channel();
-                            self.pushes
-                                .insert(push_id, PushPairing::Promised(arrived));
+                            self.pushes.insert(push_id, PushPairing::Promised(arrived));
                             PushedResponse::awaited(
                                 push_id,
                                 awaited,

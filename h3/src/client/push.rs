@@ -165,9 +165,7 @@ where
             //# H3_REQUEST_CANCELLED.
             PushStream::Arrived(Some(stream)) => {
                 stream.stop_sending(Code::H3_REQUEST_CANCELLED);
-                self.shared
-                    .qpack()
-                    .cancel_stream(stream.id().into_inner());
+                self.shared.qpack().cancel_stream(stream.id().into_inner());
                 self.shared.waker().wake();
             }
             PushStream::Awaited(_) => {
