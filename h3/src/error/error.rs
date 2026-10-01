@@ -98,6 +98,9 @@ pub enum StreamError {
     RemoteTerminate {
         /// Reset code received from the peer
         code: Code,
+        /// The reliable size of the peer's RESET_STREAM_AT: the stream's data before it was
+        /// delivered. 0 for a RESET_STREAM or a STOP_SENDING.
+        reliable_size: u64,
     },
     /// The error occurred on the connection
     #[cfg_attr(
@@ -178,7 +181,7 @@ impl std::fmt::Display for StreamError {
                 write!(f, "Stream error: {:?} - {}", code, reason)
             }
             StreamError::ConnectionError(err) => write!(f, "Connection error: {}", err),
-            StreamError::RemoteTerminate { code } => write!(f, "Remote reset: {}", code),
+            StreamError::RemoteTerminate { code, .. } => write!(f, "Remote reset: {}", code),
             StreamError::HeaderTooBig {
                 actual_size,
                 max_size,

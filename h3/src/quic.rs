@@ -66,6 +66,9 @@ pub enum StreamErrorIncoming {
     StreamTerminated {
         /// Error code sent by the peer
         error_code: u64,
+        /// The reliable size of the peer's RESET_STREAM_AT: the stream's data before it was
+        /// delivered. 0 for a RESET_STREAM or a STOP_SENDING.
+        reliable_size: u64,
     },
     /// A unknown error occurred (not relevant to h3)
     ///
@@ -83,7 +86,7 @@ impl Display for StreamErrorIncoming {
             StreamErrorIncoming::ConnectionErrorIncoming { connection_error } => {
                 write!(f, "ConnectionError: {}", connection_error)
             }
-            StreamErrorIncoming::StreamTerminated { error_code } => {
+            StreamErrorIncoming::StreamTerminated { error_code, .. } => {
                 let error_code = Code::from(*error_code);
                 write!(f, "StreamClosed: {}", error_code)
             }
@@ -180,6 +183,13 @@ pub trait SendStream<B: Buf> {
 
     /// Send a QUIC reset code.
     fn reset(&mut self, reset_code: u64);
+
+    /// Send a QUIC reset code with RESET_STREAM_AT, whose reliable size is all of the data sent
+    /// so far: it is still delivered. A plain [`reset`](Self::reset) where the peer can't receive
+    /// RESET_STREAM_AT.
+    fn reset_at_sent(&mut self, reset_code: u64) {
+        self.reset(reset_code)
+    }
 
     /// Get QUIC send stream id
     fn send_id(&self) -> StreamId;

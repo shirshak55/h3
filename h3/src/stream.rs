@@ -394,7 +394,7 @@ where
                 Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
                     return Poll::Ready(Err(PollTypeError::IncomingError(connection_error)));
                 }
-                Err(StreamErrorIncoming::StreamTerminated { error_code }) => {
+                Err(StreamErrorIncoming::StreamTerminated { error_code, .. }) => {
                     Some(StreamEnd::Reset(error_code))
                 }
                 Err(StreamErrorIncoming::Unknown(err)) => {
@@ -598,6 +598,10 @@ where
 
     fn reset(&mut self, reset_code: u64) {
         self.stream.reset(reset_code)
+    }
+
+    fn reset_at_sent(&mut self, reset_code: u64) {
+        self.stream.reset_at_sent(reset_code)
     }
 
     fn send_id(&self) -> quic::StreamId {

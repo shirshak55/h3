@@ -397,6 +397,10 @@ where
         self.send.reset(reset_code)
     }
 
+    fn reset_at_sent(&mut self, reset_code: u64) {
+        self.send.reset_at_sent(reset_code)
+    }
+
     fn send_data<D: Into<WriteBuf<B>>>(&mut self, data: D) -> Result<(), StreamErrorIncoming> {
         self.send.send_data(data)
     }
@@ -470,6 +474,14 @@ fn convert_read_error_to_stream_error(error: ReadError) -> StreamErrorIncoming {
     match error {
         ReadError::Reset(var_int) => StreamErrorIncoming::StreamTerminated {
             error_code: var_int.into_inner(),
+            reliable_size: 0,
+        },
+        ReadError::ResetAt {
+            error_code,
+            reliable_size,
+        } => StreamErrorIncoming::StreamTerminated {
+            error_code: error_code.into_inner(),
+            reliable_size,
         },
         ReadError::ConnectionLost(connection_error) => {
             StreamErrorIncoming::ConnectionErrorIncoming {
@@ -486,6 +498,7 @@ fn convert_write_error_to_stream_error(error: quinn::WriteError) -> StreamErrorI
     match error {
         quinn::WriteError::Stopped(var_int) => StreamErrorIncoming::StreamTerminated {
             error_code: var_int.into_inner(),
+            reliable_size: 0,
         },
         quinn::WriteError::ConnectionLost(connection_error) => {
             StreamErrorIncoming::ConnectionErrorIncoming {
@@ -511,6 +524,8 @@ fn zero_rtt_rejected(error: impl std::error::Error + Send + Sync + 'static) -> S
 pub struct SendStream<B: Buf> {
     stream: quinn::SendStream,
     writing: Option<WriteBuf<B>>,
+    /// The bytes written to the stream
+    sent: u64,
 }
 
 impl<B> SendStream<B>
@@ -521,6 +536,7 @@ where
         Self {
             stream: stream,
             writing: None,
+            sent: 0,
         }
     }
 }
@@ -537,6 +553,7 @@ where
                 let written = ready!(stream.poll_write(cx, data.chunk()))
                     .map_err(|err| convert_write_error_to_stream_error(err))?;
                 data.advance(written);
+                self.sent += written as u64;
             }
         }
         // all data is written
@@ -561,6 +578,14 @@ where
         let _ = self
             .stream
             .reset(VarInt::from_u64(reset_code).unwrap_or(VarInt::MAX));
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    fn reset_at_sent(&mut self, reset_code: u64) {
+        let _ = self.stream.reset_at(
+            VarInt::from_u64(reset_code).unwrap_or(VarInt::MAX),
+            self.sent,
+        );
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
@@ -609,6 +634,7 @@ where
         match res {
             Ok(written) => {
                 buf.advance(written);
+                self.sent += written as u64;
                 Poll::Ready(Ok(written))
             }
             Err(err) => Poll::Ready(Err(convert_write_error_to_stream_error(err))),

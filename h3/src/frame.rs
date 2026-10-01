@@ -209,6 +209,10 @@ where
         self.stream.reset(reset_code)
     }
 
+    fn reset_at_sent(&mut self, reset_code: u64) {
+        self.stream.reset_at_sent(reset_code)
+    }
+
     fn send_id(&self) -> StreamId {
         self.stream.send_id()
     }

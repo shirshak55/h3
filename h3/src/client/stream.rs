@@ -277,6 +277,12 @@ where
         self.inner.stop_stream(error_code);
     }
 
+    /// Stop a stream with an error code, the data sent so far still delivered: with
+    /// RESET_STREAM_AT, where the peer can receive it
+    pub fn stop_stream_at_sent(&mut self, error_code: Code) {
+        self.inner.stop_stream_at_sent(error_code);
+    }
+
     /// Send a set of trailers to end the request.
     ///
     /// [`RequestStream::finish()`] must be called to finalize a request.

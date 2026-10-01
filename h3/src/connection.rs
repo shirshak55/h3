@@ -263,7 +263,9 @@ where
             Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
                 Err(self.handle_connection_error(connection_error))
             }
-            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => Err(self
+            Err(StreamErrorIncoming::StreamTerminated {
+                error_code: err, ..
+            }) => Err(self
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
                 //# If either control
                 //# stream is closed at any point, this MUST be treated as a connection
@@ -312,7 +314,9 @@ where
             Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
                 return Err(conn.handle_quic_error_raw(connection_error));
             }
-            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => {
+            Err(StreamErrorIncoming::StreamTerminated {
+                error_code: err, ..
+            }) => {
                 return Err(
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
                     //# If either control
@@ -496,7 +500,9 @@ where
             Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error }) => {
                 Err(self.handle_connection_error(connection_error))
             }
-            Err(StreamErrorIncoming::StreamTerminated { error_code: err }) => Err(self
+            Err(StreamErrorIncoming::StreamTerminated {
+                error_code: err, ..
+            }) => Err(self
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
                 //# If either control
                 //# stream is closed at any point, this MUST be treated as a connection
@@ -707,6 +713,7 @@ where
             })) => return Poll::Ready(Err(self.handle_connection_error(connection_error))),
             Err(FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated {
                 error_code: err,
+                ..
             })) =>
             //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
             //# If either control
@@ -1598,6 +1605,13 @@ where
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn stop_stream(&mut self, code: Code) {
         self.stream.reset(code.into());
+    }
+
+    /// Stops a stream with an error code, the data sent so far still delivered: with
+    /// RESET_STREAM_AT, where the peer can receive it
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn stop_stream_at_sent(&mut self, code: Code) {
+        self.stream.reset_at_sent(code.into());
     }
 
     #[allow(missing_docs)]
