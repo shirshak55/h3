@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert::TryFrom,
     marker::PhantomData,
     sync::Arc,
@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{instrument, warn};
 
 use crate::{
-    client::{PushDelivery, PushedRequest, PushedResponse},
+    client::{PromisedPush, PushDelivery, PushedRequest, PushedResponse, RecvEvent},
     config::Config,
     error::{
         connection_error_creators::{
@@ -1384,6 +1384,15 @@ pub struct RequestStream<S, B> {
     pub(crate) push_end: Option<PushEnd>,
     /// A PUSH_PROMISE (push ID, field section) being decoded
     promise: Option<(u64, Bytes)>,
+    /// The promises decoded ahead of the frame a caller asked for (those before the
+    /// response HEADERS, for one), in wire order, until a caller takes them
+    promises: VecDeque<PromisedPush>,
+}
+
+/// The next frame of a request stream, or a PUSH_PROMISE delivered in its place
+pub(crate) enum NextFrame {
+    Frame(Option<Frame<PayloadLen>>),
+    Promise(PromisedPush),
 }
 
 impl<S, B> RequestStream<S, B> {
@@ -1403,7 +1412,14 @@ impl<S, B> RequestStream<S, B> {
             qpack_end: None,
             push_end: None,
             promise: None,
+            promises: VecDeque::new(),
         }
+    }
+
+    /// Takes the promises decoded so far that no caller received in band: those ahead of
+    /// the response HEADERS, in wire order.
+    pub fn take_promises(&mut self) -> Vec<PromisedPush> {
+        self.promises.drain(..).collect()
     }
 
     /// The stream was read to its end: no QPACK Stream Cancellation is due.
@@ -1438,11 +1454,26 @@ where
     S: quic::RecvStream,
 {
     /// The next frame. When this client sent MAX_PUSH_ID, a PUSH_PROMISE is decoded instead
-    /// (acknowledging its QPACK references), recorded and cancelled or delivered.
+    /// (acknowledging its QPACK references), recorded and cancelled or delivered; one
+    /// delivered is kept for [`Self::take_promises`].
     pub(crate) fn poll_next_frame(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, StreamError>> {
+        loop {
+            match ready!(self.poll_next_frame_or_promise(cx))? {
+                NextFrame::Frame(frame) => return Poll::Ready(Ok(frame)),
+                NextFrame::Promise(promise) => self.promises.push_back(promise),
+            }
+        }
+    }
+
+    /// The next frame, or a PUSH_PROMISE delivered to this client where it stood among the
+    /// frames (see [`Self::poll_next_frame`]).
+    fn poll_next_frame_or_promise(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<NextFrame, StreamError>> {
         loop {
             if let Some((push_id, encoded)) = &self.promise {
                 let stream = self.stream.id();
@@ -1466,8 +1497,17 @@ where
                         )));
                     }
                 };
-                if let Err(error) = self.conn_state.promise(push_id, stream, fields) {
-                    return Poll::Ready(Err(self.handle_connection_error_on_stream(error)));
+                match self.conn_state.promise(push_id, stream, fields) {
+                    Ok(Some(request)) => {
+                        return Poll::Ready(Ok(NextFrame::Promise(PromisedPush {
+                            push_id,
+                            request,
+                        })))
+                    }
+                    Ok(None) => (),
+                    Err(error) => {
+                        return Poll::Ready(Err(self.handle_connection_error_on_stream(error)))
+                    }
                 }
             }
 
@@ -1475,7 +1515,7 @@ where
                 Ok(Some(Frame::PushPromise(promise))) if self.conn_state.accepts_pushes() => {
                     self.promise = Some((promise.id, promise.encoded));
                 }
-                Ok(frame) => return Poll::Ready(Ok(frame)),
+                Ok(frame) => return Poll::Ready(Ok(NextFrame::Frame(frame))),
                 Err(e) => {
                     return Poll::Ready(Err(self.handle_frame_stream_error_on_request_stream(e)))
                 }
@@ -1489,20 +1529,43 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, StreamError>> {
-        if !self.stream.has_data() {
-            match ready!(self.poll_next_frame(cx)) {
+        loop {
+            match ready!(self.poll_recv_event(cx)) {
+                Ok(Some(RecvEvent::Data(data))) => return Poll::Ready(Ok(Some(data))),
+                // Delivered to the connection's push receiver too.
+                Ok(Some(RecvEvent::PushPromise(_))) => (),
+                Ok(None) => return Poll::Ready(Ok(None)),
                 Err(error) => return Poll::Ready(Err(error)),
-                Ok(None) => {
+            }
+        }
+    }
+
+    /// Receive some of the body, or a PUSH_PROMISE where it stood among the body's DATA
+    /// frames (one ahead of the HEADERS, decoded reading them, comes first).
+    pub fn poll_recv_event(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<RecvEvent<impl Buf>>, StreamError>> {
+        if let Some(promise) = self.promises.pop_front() {
+            return Poll::Ready(Ok(Some(RecvEvent::PushPromise(promise))));
+        }
+        if !self.stream.has_data() {
+            match ready!(self.poll_next_frame_or_promise(cx)) {
+                Err(error) => return Poll::Ready(Err(error)),
+                Ok(NextFrame::Promise(promise)) => {
+                    return Poll::Ready(Ok(Some(RecvEvent::PushPromise(promise))));
+                }
+                Ok(NextFrame::Frame(None)) => {
                     self.ended();
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Headers(encoded))) => {
+                Ok(NextFrame::Frame(Some(Frame::Headers(encoded)))) => {
                     self.trailers = Some(encoded);
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
                 }
-                Ok(Some(Frame::Data { .. })) => (),
-                Ok(Some(other_frame)) => {
+                Ok(NextFrame::Frame(Some(Frame::Data { .. }))) => (),
+                Ok(NextFrame::Frame(Some(other_frame))) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
                     //# Receipt of an invalid sequence of frames MUST be treated as a
                     //# connection error of type H3_FRAME_UNEXPECTED.
@@ -1538,6 +1601,7 @@ where
 
         self.stream
             .poll_data(cx)
+            .map_ok(|data| data.map(RecvEvent::Data))
             .map_err(|error| self.handle_frame_stream_error_on_request_stream(error))
     }
 
@@ -1832,6 +1896,7 @@ where
                 qpack_end: None,
                 push_end: None,
                 promise: None,
+                promises: VecDeque::new(),
             },
             RequestStream {
                 stream: recv,
@@ -1842,6 +1907,7 @@ where
                 qpack_end: self.qpack_end,
                 push_end: self.push_end,
                 promise: self.promise,
+                promises: self.promises,
             },
         )
     }

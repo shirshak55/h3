@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
     },
     task::{Context, Poll, Waker},
@@ -27,6 +27,9 @@ use crate::{
     quic::StreamId,
 };
 
+/// `SharedState::max_push_id` before the client sent MAX_PUSH_ID (no push ID is that large)
+const NO_MAX_PUSH_ID: u64 = u64::MAX;
+
 #[derive(Debug)]
 /// This struct represents the shared state of the h3 connection and the stream structs
 pub struct SharedState {
@@ -46,9 +49,9 @@ pub struct SharedState {
     control_in_flight: AtomicBool,
     /// Tasks waiting for the control-stream frames queued so far to reach the transport
     control_written: Mutex<Vec<Waker>>,
-    /// The MAX_PUSH_ID this client sent: it tolerates pushes, cancelling them unless they
-    /// are delivered
-    max_push_id: OnceLock<u64>,
+    /// The MAX_PUSH_ID this client sent (`NO_MAX_PUSH_ID` until it sent one): it tolerates
+    /// pushes, cancelling them unless they are delivered
+    max_push_id: AtomicU64,
     /// Whether this client delivers the pushes ([`crate::client::Builder::deliver_pushes`])
     deliver_pushes: AtomicBool,
     /// The pushes this client saw
@@ -116,7 +119,7 @@ impl Default for SharedState {
             control_out: Mutex::new(BytesMut::new()),
             control_in_flight: AtomicBool::new(false),
             control_written: Mutex::new(Vec::new()),
-            max_push_id: OnceLock::new(),
+            max_push_id: AtomicU64::new(NO_MAX_PUSH_ID),
             deliver_pushes: AtomicBool::new(false),
             pushes: Mutex::new(Pushes::default()),
             push_ids: Mutex::new(PushIds::default()),
@@ -168,18 +171,41 @@ impl SharedState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Records the MAX_PUSH_ID this client sent, which only grows.
     pub(crate) fn set_max_push_id(&self, max_push_id: u64) {
-        let _ = self.max_push_id.set(max_push_id);
+        if !self
+            .max_push_id()
+            .is_some_and(|current| max_push_id <= current)
+        {
+            self.max_push_id.store(max_push_id, Ordering::Release);
+        }
+    }
+
+    /// Queues MAX_PUSH_ID `max_push_id` on the control stream and records it; `max_push_id`
+    /// must not be below the one sent before.
+    pub(crate) fn send_max_push_id(&self, max_push_id: u64) -> Result<(), u64> {
+        if self
+            .max_push_id()
+            .is_some_and(|current| max_push_id < current)
+        {
+            return Err(self.max_push_id.load(Ordering::Acquire));
+        }
+        self.set_max_push_id(max_push_id);
+        self.send_control_frame(&ControlFrame::MaxPushId(max_push_id));
+        Ok(())
     }
 
     /// Whether this client sent MAX_PUSH_ID, so it tolerates pushes
     pub(crate) fn accepts_pushes(&self) -> bool {
-        self.max_push_id.get().is_some()
+        self.max_push_id().is_some()
     }
 
     /// The MAX_PUSH_ID this client sent
     pub(crate) fn max_push_id(&self) -> Option<u64> {
-        self.max_push_id.get().copied()
+        match self.max_push_id.load(Ordering::Acquire) {
+            NO_MAX_PUSH_ID => None,
+            max => Some(max),
+        }
     }
 
     pub(crate) fn set_deliver_pushes(&self, enabled: bool) {
@@ -224,7 +250,7 @@ impl SharedState {
         push_id: u64,
         stream: StreamId,
         fields: Vec<HeaderField>,
-    ) -> Result<(), InternalConnectionError> {
+    ) -> Result<Option<http::Request<()>>, InternalConnectionError> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
         //# A client MUST treat
         //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
@@ -273,7 +299,7 @@ impl SharedState {
         }
         // The same promise again: handled already.
         if previous.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         if !self.delivers_pushes() {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
@@ -282,24 +308,29 @@ impl SharedState {
             if !streamed {
                 self.send_control_frame(&ControlFrame::CancelPush(push_id));
             }
-            return Ok(());
+            return Ok(None);
         }
-        let pending = match promised_request(fields) {
-            Ok(request) => PushPending::Promised {
-                push_id,
-                stream,
-                request,
-            },
+        let (pending, in_band) = match promised_request(fields.clone())
+            .and_then(|request| promised_request(fields).map(|in_band| (request, in_band)))
+        {
+            Ok((request, in_band)) => (
+                PushPending::Promised {
+                    push_id,
+                    stream,
+                    request,
+                },
+                Some(in_band),
+            ),
             Err(_) => {
                 if !streamed {
                     self.send_control_frame(&ControlFrame::CancelPush(push_id));
                 }
-                PushPending::Cancel(push_id)
+                (PushPending::Cancel(push_id), None)
             }
         };
         pushes.pending.push(pending);
         self.waker.wake();
-        Ok(())
+        Ok(in_band)
     }
 
     /// Tells the connection driver the request stream `stream` promises no more pushes.

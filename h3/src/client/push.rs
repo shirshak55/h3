@@ -34,6 +34,28 @@ where
     Ended(StreamId),
 }
 
+/// A PUSH_PROMISE where it stood among a request stream's frames (see
+/// [`RequestStream::poll_recv_event`]): the push ID and the promised request, whose
+/// response [`PushDelivery::Promised`] carries under the same push ID
+#[derive(Debug)]
+pub struct PromisedPush {
+    /// The push ID
+    pub push_id: u64,
+    /// The promised request, with its [`HeaderOrder`](crate::ext::HeaderOrder) and
+    /// [`PseudoOrder`](crate::ext::PseudoOrder)
+    pub request: http::Request<()>,
+}
+
+/// What [`RequestStream::poll_recv_event`] yields: body data, or a PUSH_PROMISE in its wire
+/// position among the DATA frames
+#[allow(clippy::large_enum_variant)]
+pub enum RecvEvent<D> {
+    /// Some of the body
+    Data(D),
+    /// A PUSH_PROMISE delivered to this client
+    PushPromise(PromisedPush),
+}
+
 /// A push the server promised on a request stream: the request it answers, and the
 /// response it pushes
 pub struct PushedRequest<R, B>

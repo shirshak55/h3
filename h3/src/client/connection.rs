@@ -285,6 +285,24 @@ where
         Ok(())
     }
 
+    /// Sends MAX_PUSH_ID `max_push_id` on the control stream, raising the one sent so far
+    /// ([`super::Builder::control_frames`]) or sending a first: the server may push up to it
+    /// from now on. Fails once the connection failed, or if `max_push_id` is below the one
+    /// sent before. The connection driver writes it.
+    pub fn send_max_push_id(&self, max_push_id: u64) -> Result<(), StreamError> {
+        if let Some(error) = self.get_conn_error() {
+            return Err(StreamError::ConnectionError(convert_to_connection_error(
+                error,
+            )));
+        }
+        self.conn_state
+            .send_max_push_id(max_push_id)
+            .map_err(|current| StreamError::StreamError {
+                code: Code::H3_ID_ERROR,
+                reason: format!("MAX_PUSH_ID {max_push_id} below the {current} sent"),
+            })
+    }
+
     /// Resolves once the control-stream frames queued so far (a
     /// [`send_priority_update`](Self::send_priority_update)) reached the transport, so a
     /// request sent after it goes out after them.

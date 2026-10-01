@@ -6,6 +6,7 @@ use quic::StreamId;
 use tracing::instrument;
 
 use crate::{
+    client::{PromisedPush, RecvEvent},
     connection::{self},
     error::{
         connection_error_creators::CloseStream, internal_error::InternalConnectionError, Code,
@@ -210,6 +211,23 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, StreamError>> {
         self.inner.poll_recv_data(cx)
+    }
+
+    /// Receive some of the response body, or a PUSH_PROMISE delivered to this client
+    /// ([`super::Builder::deliver_pushes`]) where it stood among the body's DATA frames; its
+    /// pushed response comes through [`super::Connection::subscribe_pushes`] under the same
+    /// push ID. `None` once the body ended (trailers may follow).
+    pub fn poll_recv_event(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<RecvEvent<impl Buf>>, StreamError>> {
+        self.inner.poll_recv_event(cx)
+    }
+
+    /// The promises delivered to this client that [`Self::recv_response`] decoded ahead of
+    /// the response HEADERS, in wire order; taken once.
+    pub fn take_promises(&mut self) -> Vec<PromisedPush> {
+        self.inner.take_promises()
     }
 
     /// Receive an optional set of trailers for the response.
