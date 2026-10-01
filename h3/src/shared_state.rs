@@ -2,22 +2,29 @@
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, MutexGuard, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock,
     },
     task::{Context, Poll, Waker},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures_util::task::AtomicWaker;
+use http::HeaderName;
 
 use crate::{
     config::Settings,
-    error::internal_error::ErrorOrigin,
-    proto::headers::Header,
-    qpack::{Decoded, DecoderError, EncoderError, QpackState},
+    error::{
+        internal_error::{ErrorOrigin, InternalConnectionError},
+        Code,
+    },
+    ext::{ControlFrame, HeaderOrder, PushEvent},
+    proto::headers::{Header, HeaderError},
+    qpack::{Decoded, DecoderError, EncoderError, HeaderField, QpackState},
+    quic::StreamId,
 };
 
 #[derive(Debug)]
@@ -39,10 +46,63 @@ pub struct SharedState {
     control_in_flight: AtomicBool,
     /// Tasks waiting for the control-stream frames queued so far to reach the transport
     control_written: Mutex<Vec<Waker>>,
-    /// The MAX_PUSH_ID this client sent: it tolerates pushes, cancelling them
+    /// The MAX_PUSH_ID this client sent: it tolerates pushes, cancelling them unless they
+    /// are delivered
     max_push_id: OnceLock<u64>,
-    /// The first pushes seen, and the push IDs promised or pushed
-    pushes: Mutex<(Vec<crate::ext::PushEvent>, HashSet<u64>)>,
+    /// Whether this client delivers the pushes ([`crate::client::Builder::deliver_pushes`])
+    deliver_pushes: AtomicBool,
+    /// The pushes this client saw
+    pushes: Mutex<Pushes>,
+    /// The push IDs this server allocates below the client's MAX_PUSH_ID
+    push_ids: Mutex<PushIds>,
+}
+
+/// A client's record of the server's pushes
+#[derive(Debug, Default)]
+struct Pushes {
+    /// The first events seen
+    events: Vec<PushEvent>,
+    /// Each push ID promised or pushed
+    ids: HashMap<u64, PushSeen>,
+    /// What the request streams hand the connection driver
+    pending: Vec<PushPending>,
+}
+
+/// How a push ID was seen
+#[derive(Debug, Default)]
+struct PushSeen {
+    /// The hash of the promised request's field lines
+    promise: Option<u64>,
+    /// Its push stream arrived
+    streamed: bool,
+}
+
+/// What a request stream hands the connection driver about pushes
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PushPending {
+    /// A PUSH_PROMISE decoded on the request stream `stream`
+    Promised {
+        push_id: u64,
+        stream: StreamId,
+        request: http::Request<()>,
+    },
+    /// A promise that can't be delivered (its request is malformed): its push stream, if it
+    /// arrived, is stopped
+    Cancel(u64),
+    /// The request stream was read to its end or dropped: it promises no more
+    Ended(StreamId),
+}
+
+/// A server's push IDs, allocated in order below the client's MAX_PUSH_ID
+#[derive(Debug, Default)]
+struct PushIds {
+    /// The client's MAX_PUSH_ID
+    max: Option<u64>,
+    /// The next push ID to allocate: those below were promised
+    next: u64,
+    /// Tasks waiting for a push ID the client's MAX_PUSH_ID doesn't allow yet
+    wakers: Vec<Waker>,
 }
 
 impl Default for SharedState {
@@ -57,7 +117,9 @@ impl Default for SharedState {
             control_in_flight: AtomicBool::new(false),
             control_written: Mutex::new(Vec::new()),
             max_push_id: OnceLock::new(),
-            pushes: Mutex::new((Vec::new(), HashSet::new())),
+            deliver_pushes: AtomicBool::new(false),
+            pushes: Mutex::new(Pushes::default()),
+            push_ids: Mutex::new(PushIds::default()),
         }
     }
 }
@@ -115,35 +177,206 @@ impl SharedState {
         self.max_push_id.get().is_some()
     }
 
-    fn pushes_lock(&self) -> MutexGuard<'_, (Vec<crate::ext::PushEvent>, HashSet<u64>)> {
+    /// The MAX_PUSH_ID this client sent
+    pub(crate) fn max_push_id(&self) -> Option<u64> {
+        self.max_push_id.get().copied()
+    }
+
+    pub(crate) fn set_deliver_pushes(&self, enabled: bool) {
+        self.deliver_pushes.store(enabled, Ordering::Release);
+    }
+
+    /// Whether this client delivers the pushes it tolerates, rather than cancel them
+    pub(crate) fn delivers_pushes(&self) -> bool {
+        self.accepts_pushes() && self.deliver_pushes.load(Ordering::Acquire)
+    }
+
+    fn pushes_lock(&self) -> MutexGuard<'_, Pushes> {
         self.pushes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Records a push the client saw (the first 16), sending CANCEL_PUSH for a promise whose
-    /// push stream has not arrived.
-    pub(crate) fn record_push(&self, event: crate::ext::PushEvent) {
+    /// Records a server's CANCEL_PUSH the client saw (the first 16 events).
+    pub(crate) fn record_push(&self, event: PushEvent) {
         let mut pushes = self.pushes_lock();
-        match event {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
-            //# A client SHOULD NOT send a CANCEL_PUSH frame
-            //# when it has already received a corresponding push stream.
-            crate::ext::PushEvent::Promise { push_id, .. } if pushes.1.insert(push_id) => {
-                self.send_control_frame(&crate::ext::ControlFrame::CancelPush(push_id));
-            }
-            crate::ext::PushEvent::Stream { push_id, .. } => {
-                pushes.1.insert(push_id);
-            }
-            _ => (),
-        }
-        if pushes.0.len() < 16 {
-            pushes.0.push(event);
+        if pushes.events.len() < 16 {
+            pushes.events.push(event);
         }
     }
 
-    pub(crate) fn pushes(&self) -> Vec<crate::ext::PushEvent> {
-        self.pushes_lock().0.clone()
+    /// Records the push stream `stream` for `push_id`: whether it is the first for that ID.
+    pub(crate) fn push_stream(&self, push_id: u64, stream: StreamId) -> bool {
+        let mut pushes = self.pushes_lock();
+        let first = !std::mem::replace(&mut pushes.ids.entry(push_id).or_default().streamed, true);
+        if pushes.events.len() < 16 {
+            pushes.events.push(PushEvent::Stream { push_id, stream });
+        }
+        first
+    }
+
+    /// A PUSH_PROMISE decoded on the request stream `stream`, checked against MAX_PUSH_ID and
+    /// the push ID's earlier promise and recorded; then cancelled (CANCEL_PUSH, unless its
+    /// push stream arrived) or, when pushes are delivered, handed to the connection driver as
+    /// a request.
+    pub(crate) fn promise(
+        &self,
+        push_id: u64,
+        stream: StreamId,
+        fields: Vec<HeaderField>,
+    ) -> Result<(), InternalConnectionError> {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+        //# A client MUST treat
+        //# receipt of a PUSH_PROMISE frame that contains a larger push ID than
+        //# the client has advertised as a connection error of H3_ID_ERROR.
+        if self.max_push_id().is_none_or(|max| push_id > max) {
+            return Err(InternalConnectionError::new(
+                Code::H3_ID_ERROR,
+                format!("PUSH_PROMISE with push ID {push_id} above MAX_PUSH_ID"),
+            ));
+        }
+        let mut hasher = DefaultHasher::new();
+        for field in &fields {
+            field.name.as_ref().hash(&mut hasher);
+            field.value.as_ref().hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        let mut pushes = self.pushes_lock();
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+        //# If a client
+        //# receives a push ID that has already been promised and detects a
+        //# mismatch, it MUST respond with a connection error of type
+        //# H3_GENERAL_PROTOCOL_ERROR.
+        let seen = pushes.ids.entry(push_id).or_default();
+        let previous = seen.promise.replace(hash);
+        let streamed = seen.streamed;
+        if previous.is_some_and(|earlier| earlier != hash) {
+            return Err(InternalConnectionError::new(
+                Code::H3_GENERAL_PROTOCOL_ERROR,
+                format!("PUSH_PROMISE with push ID {push_id} differs from its earlier promise"),
+            ));
+        }
+        if pushes.events.len() < 16 {
+            pushes.events.push(PushEvent::Promise {
+                push_id,
+                stream,
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            Bytes::copy_from_slice(&field.name),
+                            Bytes::copy_from_slice(&field.value),
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        // The same promise again: handled already.
+        if previous.is_some() {
+            return Ok(());
+        }
+        if !self.delivers_pushes() {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+            //# A client SHOULD NOT send a CANCEL_PUSH frame
+            //# when it has already received a corresponding push stream.
+            if !streamed {
+                self.send_control_frame(&ControlFrame::CancelPush(push_id));
+            }
+            return Ok(());
+        }
+        let pending = match promised_request(fields) {
+            Ok(request) => PushPending::Promised {
+                push_id,
+                stream,
+                request,
+            },
+            Err(_) => {
+                if !streamed {
+                    self.send_control_frame(&ControlFrame::CancelPush(push_id));
+                }
+                PushPending::Cancel(push_id)
+            }
+        };
+        pushes.pending.push(pending);
+        self.waker.wake();
+        Ok(())
+    }
+
+    /// Tells the connection driver the request stream `stream` promises no more pushes.
+    fn push_ended(&self, stream: StreamId) {
+        self.pushes_lock().pending.push(PushPending::Ended(stream));
+        self.waker.wake();
+    }
+
+    /// What the request streams handed the connection driver since it last took them.
+    pub(crate) fn take_pending_pushes(&self) -> Vec<PushPending> {
+        std::mem::take(&mut self.pushes_lock().pending)
+    }
+
+    pub(crate) fn pushes(&self) -> Vec<PushEvent> {
+        self.pushes_lock().events.clone()
+    }
+
+    fn push_ids_lock(&self) -> MutexGuard<'_, PushIds> {
+        self.push_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records the client's MAX_PUSH_ID, which may only grow.
+    pub(crate) fn set_peer_max_push_id(&self, max: u64) -> Result<(), InternalConnectionError> {
+        let mut ids = self.push_ids_lock();
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+        //# A MAX_PUSH_ID frame cannot reduce the maximum push
+        //# ID; receipt of a MAX_PUSH_ID frame that contains a smaller value than
+        //# previously received MUST be treated as a connection error of type
+        //# H3_ID_ERROR.
+        if ids.max.is_some_and(|current| max < current) {
+            return Err(InternalConnectionError::new(
+                Code::H3_ID_ERROR,
+                format!("MAX_PUSH_ID {max} below the earlier one"),
+            ));
+        }
+        ids.max = Some(max);
+        for waker in ids.wakers.drain(..) {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    /// Allocates the next push ID, once the client's MAX_PUSH_ID allows it; a connection
+    /// error wakes the waiters, who check it.
+    pub(crate) fn poll_allocate_push_id(&self, cx: &mut Context<'_>) -> Poll<u64> {
+        let mut ids = self.push_ids_lock();
+        if ids.max.is_some_and(|max| ids.next <= max) {
+            let id = ids.next;
+            ids.next += 1;
+            return Poll::Ready(id);
+        }
+        if !ids.wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+            ids.wakers.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+
+    /// The next push ID, if the client's MAX_PUSH_ID allows one now.
+    pub(crate) fn try_allocate_push_id(&self) -> Option<u64> {
+        let mut ids = self.push_ids_lock();
+        ids.max.is_some_and(|max| ids.next <= max).then(|| {
+            ids.next += 1;
+            ids.next - 1
+        })
+    }
+
+    /// Whether the server promised (allocated) `push_id`.
+    pub(crate) fn push_id_promised(&self, push_id: u64) -> bool {
+        push_id < self.push_ids_lock().next
+    }
+
+    fn wake_push_id_waiters(&self) {
+        for waker in self.push_ids_lock().wakers.drain(..) {
+            waker.wake();
+        }
     }
 
     pub(crate) fn qpack(&self) -> MutexGuard<'_, QpackState> {
@@ -209,6 +442,51 @@ impl Drop for QpackStreamEnd {
     }
 }
 
+/// The request a PUSH_PROMISE's field lines carry
+fn promised_request(fields: Vec<HeaderField>) -> Result<http::Request<()>, HeaderError> {
+    // Pseudo-header names aren't header names, so this lists the regular fields.
+    let order = fields
+        .iter()
+        .filter_map(|field| HeaderName::from_bytes(&field.name).ok())
+        .collect();
+    let header = Header::try_from(fields)?;
+    let pseudo_order = header.pseudo_order().clone();
+    let (method, uri, protocol, headers) = header.into_request_parts()?;
+    let mut request = http::Request::new(());
+    *request.method_mut() = method;
+    *request.uri_mut() = uri;
+    *request.headers_mut() = headers;
+    *request.version_mut() = http::Version::HTTP_3;
+    if let Some(protocol) = protocol {
+        request.extensions_mut().insert(protocol);
+    }
+    request.extensions_mut().insert(HeaderOrder(order));
+    request.extensions_mut().insert(pseudo_order);
+    Ok(request)
+}
+
+/// Tells the connection driver a request stream promises no more pushes, once dropped
+pub(crate) struct PushEnd {
+    shared: Arc<SharedState>,
+    stream_id: StreamId,
+}
+
+impl PushEnd {
+    /// Tracks `stream_id` when the connection delivers pushes.
+    pub(crate) fn track(shared: &Arc<SharedState>, stream_id: StreamId) -> Option<Self> {
+        shared.delivers_pushes().then(|| Self {
+            shared: shared.clone(),
+            stream_id,
+        })
+    }
+}
+
+impl Drop for PushEnd {
+    fn drop(&mut self) {
+        self.shared.push_ended(self.stream_id);
+    }
+}
+
 impl ConnectionState for SharedState {
     fn shared_state(&self) -> &SharedState {
         self
@@ -232,6 +510,7 @@ pub trait ConnectionState {
             .shared_state()
             .connection_error
             .get_or_init(move || error);
+        self.shared_state().wake_push_id_waiters();
         err.clone()
     }
 

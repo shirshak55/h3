@@ -135,6 +135,18 @@ impl Builder {
         self
     }
 
+    /// Deliver the pushes the server makes after this client's MAX_PUSH_ID
+    /// ([`Builder::control_frames`]) through [`Connection::subscribe_pushes`], instead of
+    /// cancelling them: each PUSH_PROMISE as a [`PushedRequest`] with its [`PushedResponse`].
+    /// Without a MAX_PUSH_ID nothing is delivered.
+    ///
+    /// [`PushedRequest`]: super::PushedRequest
+    /// [`PushedResponse`]: super::PushedResponse
+    pub fn deliver_pushes(&mut self, enabled: bool) -> &mut Self {
+        self.config.deliver_pushes = enabled;
+        self
+    }
+
     /// Send these (identifier, value) pairs, in this order, as the SETTINGS frame instead of
     /// the generated ones.
     ///

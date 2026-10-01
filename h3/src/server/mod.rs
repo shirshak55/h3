@@ -49,11 +49,13 @@
 
 mod builder;
 mod connection;
+mod push;
 mod request;
 mod stream;
 
 pub use builder::builder;
 pub use builder::Builder;
 pub use connection::Connection;
+pub use push::PushOpener;
 pub use request::RequestResolver;
 pub use stream::RequestStream;

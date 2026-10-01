@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     convert::TryFrom,
     marker::PhantomData,
     sync::Arc,
@@ -9,12 +10,13 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures_util::{future, ready};
 use http::{HeaderMap, HeaderName};
 use stream::WriteBuf;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "tracing")]
 use tracing::{instrument, warn};
 
 use crate::{
+    client::{PushDelivery, PushedRequest, PushedResponse},
     config::Config,
     error::{
         connection_error_creators::{
@@ -23,7 +25,7 @@ use crate::{
         internal_error::{ErrorOrigin, InternalConnectionError},
         Code, ConnectionError, StreamError,
     },
-    ext::{ControlFrame, HeaderOrder, PushEvent},
+    ext::{ControlFrame, HeaderOrder},
     frame::{FrameStream, FrameStreamError},
     proto::{
         coding::Encode,
@@ -34,7 +36,7 @@ use crate::{
     },
     qpack,
     quic::{self, RecvStream, SendStream, StreamErrorIncoming, StreamId},
-    shared_state::{ConnectionState, QpackStreamEnd, SharedState},
+    shared_state::{ConnectionState, PushEnd, PushPending, QpackStreamEnd, SharedState},
     stream::{self, AcceptRecvStream, AcceptedRecvStream, BufRecvStream, Queued, UniStreamHeader},
     webtransport::SessionId,
 };
@@ -73,6 +75,14 @@ where
     decoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
     encoder_send: Option<C::SendStream>,
     encoder_recv: Option<AcceptedRecvStream<C::RecvStream, B>>,
+}
+
+/// A server push a client delivering pushes is pairing
+enum PushPairing<R, B> {
+    /// The promise was delivered: its response waits for the push stream
+    Promised(oneshot::Sender<FrameStream<R, B>>),
+    /// The push stream arrived before its promise
+    Stream(FrameStream<R, B>),
 }
 
 #[allow(missing_docs)]
@@ -128,6 +138,12 @@ where
     encoder_typed: bool,
     /// Control-stream frames being written after SETTINGS
     control_queue: Queued,
+    /// The server's pushes being paired, by push ID
+    pushes: HashMap<u64, PushPairing<C::RecvStream, B>>,
+    /// The push IDs the server cancelled before their promise arrived
+    cancelled_pushes: HashSet<u64>,
+    /// Delivers the pushes paired
+    pushes_tx: Option<mpsc::UnboundedSender<PushDelivery<C::RecvStream, B>>>,
     /// SETTINGS and the rest written on the unidirectional streams are held back until
     /// [`Self::start`]
     deferred: bool,
@@ -374,6 +390,9 @@ where
             decoder_typed: !config.qpack_lazy_stream_types,
             encoder_typed: !config.qpack_lazy_stream_types,
             control_queue: Queued::default(),
+            pushes: HashMap::new(),
+            cancelled_pushes: HashSet::new(),
+            pushes_tx: None,
             deferred: config.defer_settings,
             send_grease_frame: config.send_grease_frame,
             // send grease stream if configured
@@ -412,6 +431,7 @@ where
         {
             self.shared.set_max_push_id(max_push_id);
         }
+        self.shared.set_deliver_pushes(self.config.deliver_pushes);
         if self.qpack_encoding {
             let capacity = self.config.qpack_encoder_capacity;
             self.shared
@@ -546,6 +566,8 @@ where
     pub fn poll_accept_recv(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
         let _ = self.poll_connection_error(cx)?;
 
+        // Push streams taken once the pending streams are no longer borrowed
+        let mut pushed = Vec::new();
         // Get all currently pending streams
         loop {
             match self
@@ -618,6 +640,9 @@ where
                         )));
                     }
                 }
+                AcceptedRecvStream::Push(push_id, stream) if self.shared.delivers_pushes() => {
+                    pushed.push((push_id, stream));
+                }
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
                 //# The
                 //# client SHOULD abort reading the stream with an error code of
@@ -626,10 +651,7 @@ where
                     let id = stream.id();
                     stream.stop_sending(Code::H3_REQUEST_CANCELLED);
                     self.shared.qpack().cancel_stream(id.into_inner());
-                    self.shared.record_push(PushEvent::Stream {
-                        push_id,
-                        stream: id,
-                    });
+                    self.shared.push_stream(push_id, id);
                 }
                 AcceptedRecvStream::WebTransportUni(id, s)
                     if self.config.settings.enable_webtransport =>
@@ -668,7 +690,158 @@ where
         // Remove all None values
         self.pending_recv_streams.retain(|s| s.is_some());
 
+        for (push_id, stream) in pushed {
+            self.accept_push_stream(push_id, stream)?;
+        }
+
         Ok(())
+    }
+
+    /// Takes the push stream `stream` for `push_id`: handed to its promise's response, or
+    /// kept until the promise arrives.
+    fn accept_push_stream(
+        &mut self,
+        push_id: u64,
+        stream: FrameStream<C::RecvStream, B>,
+    ) -> Result<(), ConnectionError> {
+        let id = stream.id();
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+        //# A client MUST treat receipt of a push stream with a push ID that is greater than
+        //# the maximum push ID as a connection error of type H3_ID_ERROR.
+        if self.shared.max_push_id().is_none_or(|max| push_id > max) {
+            return Err(self.handle_connection_error(InternalConnectionError::new(
+                Code::H3_ID_ERROR,
+                format!("push stream {id} with push ID {push_id} above MAX_PUSH_ID"),
+            )));
+        }
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+        //# If a push stream header includes a push ID that was used in another push stream
+        //# header, the client MUST treat this as a connection error of type H3_ID_ERROR.
+        if !self.shared.push_stream(push_id, id) {
+            return Err(self.handle_connection_error(InternalConnectionError::new(
+                Code::H3_ID_ERROR,
+                format!("push stream {id} repeats push ID {push_id}"),
+            )));
+        }
+        if self.cancelled_pushes.remove(&push_id) {
+            self.stop_push_stream(stream);
+            return Ok(());
+        }
+        match self.pushes.remove(&push_id) {
+            Some(PushPairing::Promised(response)) => {
+                // The response was dropped: the push is cancelled.
+                if let Err(stream) = response.send(stream) {
+                    self.stop_push_stream(stream);
+                }
+            }
+            Some(PushPairing::Stream(_)) => unreachable!("a repeated push ID fails above"),
+            None => {
+                self.pushes.insert(push_id, PushPairing::Stream(stream));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stops reading a push stream whose push is cancelled.
+    fn stop_push_stream(&mut self, mut stream: FrameStream<C::RecvStream, B>) {
+        stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+        self.shared.qpack().cancel_stream(stream.id().into_inner());
+    }
+
+    /// Pairs the promises the request streams decoded with their push streams, delivering
+    /// them to [`Self::subscribe_pushes`]'s receiver in the order the streams saw them.
+    fn poll_pushes(&mut self) {
+        for pending in self.shared.take_pending_pushes() {
+            match pending {
+                PushPending::Promised {
+                    push_id,
+                    stream,
+                    request,
+                } => {
+                    if self.cancelled_pushes.remove(&push_id) {
+                        self.cancel_pairing(push_id, false);
+                        continue;
+                    }
+                    let Some(tx) = &self.pushes_tx else {
+                        // No receiver: cancelled as a client that delivers none cancels it.
+                        self.cancel_pairing(push_id, true);
+                        continue;
+                    };
+                    let max_field_section_size = self.config.settings.max_field_section_size;
+                    let response = match self.pushes.remove(&push_id) {
+                        Some(PushPairing::Stream(stream)) => PushedResponse::arrived(
+                            push_id,
+                            stream,
+                            self.shared.clone(),
+                            max_field_section_size,
+                        ),
+                        _ => {
+                            let (arrived, awaited) = oneshot::channel();
+                            self.pushes
+                                .insert(push_id, PushPairing::Promised(arrived));
+                            PushedResponse::awaited(
+                                push_id,
+                                awaited,
+                                self.shared.clone(),
+                                max_field_section_size,
+                            )
+                        }
+                    };
+                    let promised = PushedRequest {
+                        push_id,
+                        stream,
+                        request,
+                        response,
+                    };
+                    // Dropped unreceived, the request cancels its push.
+                    if tx.send(PushDelivery::Promised(promised)).is_err() {
+                        self.pushes_tx = None;
+                    }
+                }
+                PushPending::Cancel(push_id) => self.cancel_pairing(push_id, false),
+                PushPending::Ended(stream) => {
+                    if let Some(tx) = &self.pushes_tx {
+                        let _ = tx.send(PushDelivery::Ended(stream));
+                    }
+                }
+            }
+        }
+        // A response dropped before its push stream arrived cancelled its push.
+        self.pushes
+            .retain(|_, pairing| !matches!(pairing, PushPairing::Promised(tx) if tx.is_closed()));
+    }
+
+    /// Drops the pairing of `push_id`: its push stream, if it arrived, is stopped, else
+    /// CANCEL_PUSH is sent when `cancel`.
+    fn cancel_pairing(&mut self, push_id: u64, cancel: bool) {
+        match self.pushes.remove(&push_id) {
+            Some(PushPairing::Stream(stream)) => self.stop_push_stream(stream),
+            Some(PushPairing::Promised(_)) => (),
+            None if cancel => self
+                .shared
+                .send_control_frame(&ControlFrame::CancelPush(push_id)),
+            None => (),
+        }
+    }
+
+    /// The server cancelled `push_id` (CANCEL_PUSH): its response, if delivered, fails; its
+    /// push stream, if it arrived, is stopped.
+    pub(crate) fn push_cancelled(&mut self, push_id: u64) {
+        match self.pushes.remove(&push_id) {
+            Some(PushPairing::Promised(_)) => (),
+            Some(PushPairing::Stream(stream)) => self.stop_push_stream(stream),
+            None => {
+                self.cancelled_pushes.insert(push_id);
+            }
+        }
+    }
+
+    /// Receives the server's pushes as they are promised, when this client delivers them
+    /// ([`crate::client::Builder::deliver_pushes`]), replacing any previous receiver.
+    pub fn subscribe_pushes(&mut self) -> mpsc::UnboundedReceiver<PushDelivery<C::RecvStream, B>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pushes_tx = Some(tx);
+        rx
     }
 
     /// Waits for the control stream to be received and reads subsequent frames.
@@ -685,6 +858,7 @@ where
             self.poll_accept_recv(cx)?;
             self.poll_qpack(cx)?;
             self.poll_control_send(cx)?;
+            self.poll_pushes();
             if let Some(v) = &mut self.control_recv {
                 v
             } else {
@@ -1207,6 +1381,8 @@ pub struct RequestStream<S, B> {
     send_grease_frame: bool,
     /// Cancels the stream's QPACK references unless it is read to its end
     pub(crate) qpack_end: Option<QpackStreamEnd>,
+    /// Ends the pushes promised on the stream once it is dropped
+    pub(crate) push_end: Option<PushEnd>,
     /// A PUSH_PROMISE (push ID, field section) being decoded
     promise: Option<(u64, Bytes)>,
 }
@@ -1226,6 +1402,7 @@ impl<S, B> RequestStream<S, B> {
             trailers: None,
             send_grease_frame: grease,
             qpack_end: None,
+            push_end: None,
             promise: None,
         }
     }
@@ -1262,7 +1439,7 @@ where
     S: quic::RecvStream,
 {
     /// The next frame. When this client sent MAX_PUSH_ID, a PUSH_PROMISE is decoded instead
-    /// (acknowledging its QPACK references), recorded and cancelled.
+    /// (acknowledging its QPACK references), recorded and cancelled or delivered.
     pub(crate) fn poll_next_frame(
         &mut self,
         cx: &mut Context<'_>,
@@ -1290,20 +1467,9 @@ where
                         )));
                     }
                 };
-                self.conn_state.record_push(PushEvent::Promise {
-                    push_id,
-                    stream,
-                    fields: fields
-                        .into_iter()
-                        .map(|field| {
-                            let (name, value) = field.into_inner();
-                            (
-                                Bytes::from(name.into_owned()),
-                                Bytes::from(value.into_owned()),
-                            )
-                        })
-                        .collect(),
-                });
+                if let Err(error) = self.conn_state.promise(push_id, stream, fields) {
+                    return Poll::Ready(Err(self.handle_connection_error_on_stream(error)));
+                }
             }
 
             match ready!(self.stream.poll_next(cx)) {
@@ -1665,6 +1831,7 @@ where
                 max_field_section_size: 0,
                 send_grease_frame: self.send_grease_frame,
                 qpack_end: None,
+                push_end: None,
                 promise: None,
             },
             RequestStream {
@@ -1674,6 +1841,7 @@ where
                 max_field_section_size: self.max_field_section_size,
                 send_grease_frame: self.send_grease_frame,
                 qpack_end: self.qpack_end,
+                push_end: self.push_end,
                 promise: self.promise,
             },
         )

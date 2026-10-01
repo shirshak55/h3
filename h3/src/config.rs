@@ -24,6 +24,8 @@ pub struct Config {
     pub(crate) qpack_lazy_stream_types: bool,
     /// Frames sent on the control stream after SETTINGS
     pub(crate) control_frames: Vec<crate::ext::ControlFrame>,
+    /// Deliver the pushes a client that sent MAX_PUSH_ID gets, rather than cancel them
+    pub(crate) deliver_pushes: bool,
     /// Hold back SETTINGS and the rest written on the unidirectional streams until started
     pub(crate) defer_settings: bool,
 
@@ -103,6 +105,7 @@ impl TryFrom<Config> for frame::Settings {
             send_grease,
             send_grease_frame: _,
             send_grease_stream: _,
+            deliver_pushes: _,
             send_control_grease_frame: _,
             raw_settings,
             qpack_encoder_capacity: _,
@@ -242,6 +245,7 @@ impl Default for Config {
             qpack_decoder_stream_first: false,
             qpack_lazy_stream_types: false,
             control_frames: Vec::new(),
+            deliver_pushes: false,
             defer_settings: false,
             #[cfg(test)]
             send_settings: true,

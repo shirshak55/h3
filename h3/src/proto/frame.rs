@@ -163,7 +163,7 @@ where
                 buf.write_var(f.len() as u64);
             }
             Frame::Settings(f) => f.encode(buf),
-            Frame::PushPromise(f) => f.encode(buf),
+            Frame::PushPromise(f) => f.encode_header(buf),
             Frame::CancelPush(id) => simple_frame_encode(FrameType::CANCEL_PUSH, (*id).into(), buf),
             Frame::Goaway(id) => simple_frame_encode(FrameType::GOAWAY, *id, buf),
             Frame::MaxPushId(id) => simple_frame_encode(FrameType::MAX_PUSH_ID, (*id).into(), buf),
@@ -218,6 +218,7 @@ where
                 }
             }
             Frame::Headers(b) => buf.put_slice(b),
+            Frame::PushPromise(b) => buf.put_slice(&b.encoded),
             _ => (),
         }
     }
@@ -376,10 +377,6 @@ impl PushPromise {
             id: buf.get_var()?,
             encoded: buf.copy_to_bytes(buf.remaining()),
         })
-    }
-    fn encode<B: BufMut>(&self, buf: &mut B) {
-        self.encode_header(buf);
-        buf.put(self.encoded.clone());
     }
 }
 

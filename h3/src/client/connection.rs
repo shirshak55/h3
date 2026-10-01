@@ -23,11 +23,11 @@ use crate::{
     frame::FrameStream,
     proto::{frame::Frame, headers::Header, push::PushId},
     quic::{self, SendStream as _, StreamId},
-    shared_state::{ConnectionState, QpackStreamEnd, SharedState},
+    shared_state::{ConnectionState, PushEnd, QpackStreamEnd, SharedState},
     stream::{self, BufRecvStream},
 };
 
-use super::stream::RequestStream;
+use super::{push::PushDelivery, stream::RequestStream};
 
 /// HTTP/3 request sender
 ///
@@ -231,6 +231,7 @@ where
             .map_err(|e| self.handle_quic_stream_error(e))?;
 
         let qpack_end = QpackStreamEnd::track(&self.conn_state, stream.send_id());
+        let push_end = PushEnd::track(&self.conn_state, stream.send_id());
         let mut request_stream = RequestStream {
             inner: connection::RequestStream::new(
                 FrameStream::new(BufRecvStream::new(stream)),
@@ -240,6 +241,7 @@ where
             ),
         };
         request_stream.inner.qpack_end = qpack_end;
+        request_stream.inner.push_end = push_end;
         // send the grease frame only once
         self.send_grease_frame = false;
         Ok(request_stream)
@@ -450,11 +452,21 @@ where
     }
 
     /// The first 16 pushes the server made after this client sent MAX_PUSH_ID
-    /// ([`super::Builder::control_frames`]): promises (answered with CANCEL_PUSH), push streams
-    /// (stopped with H3_REQUEST_CANCELLED) and the server's CANCEL_PUSH frames. Pushes are not
-    /// delivered.
+    /// ([`super::Builder::control_frames`]): promises (answered with CANCEL_PUSH unless
+    /// delivered), push streams (stopped with H3_REQUEST_CANCELLED unless delivered) and the
+    /// server's CANCEL_PUSH frames.
     pub fn pushes(&self) -> Vec<crate::ext::PushEvent> {
         self.inner.shared.pushes()
+    }
+
+    /// Receives the server's pushes as they are promised, each with its response, when this
+    /// client delivers them ([`super::Builder::deliver_pushes`]), and when each request
+    /// stream promises no more; replacing any previous receiver. The connection must be
+    /// driven (polled) for them to arrive. A push received by no one is cancelled.
+    pub fn subscribe_pushes(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<PushDelivery<C::RecvStream, B>> {
+        self.inner.subscribe_pushes()
     }
 
     /// How the server used its QPACK encoder stream so far. `None` unless this client
@@ -516,6 +528,7 @@ where
                     self.inner
                         .shared
                         .record_push(crate::ext::PushEvent::Cancelled { push_id: push_id.0 });
+                    self.inner.push_cancelled(push_id.0);
                 }
 
                 Ok(Frame::Goaway(id)) => {

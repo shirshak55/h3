@@ -114,8 +114,9 @@ impl Connection {
         Self::new(conn).on_stopped(hook)
     }
 
-    /// Calls `hook` with each bidirectional stream this connection accepts or opens (its
-    /// [`OpenStreams`] included), as [`Connection::with_stopped_hook`] does.
+    /// Calls `hook` with each bidirectional stream this connection accepts or opens and each
+    /// unidirectional stream it opens (its [`OpenStreams`] included, so a push stream's), as
+    /// [`Connection::with_stopped_hook`] does.
     pub fn on_stopped(mut self, hook: StoppedHook) -> Self {
         self.stopped_hook = Some(hook);
         self
@@ -244,6 +245,9 @@ where
             .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_connection_error(e),
             })?;
+        if let Some(hook) = &self.stopped_hook {
+            hook(send.id(), Box::pin(send.stopped()));
+        }
         Poll::Ready(Ok(Self::SendStream::new(send)))
     }
 
@@ -315,6 +319,9 @@ where
             .map_err(|e| StreamErrorIncoming::ConnectionErrorIncoming {
                 connection_error: convert_connection_error(e),
             })?;
+        if let Some(hook) = &self.stopped_hook {
+            hook(send.id(), Box::pin(send.stopped()));
+        }
         Poll::Ready(Ok(Self::SendStream::new(send)))
     }
 

@@ -17,7 +17,7 @@ use crate::{
         coding::{Decode as _, Encode},
         frame::{Frame, Settings},
         stream::StreamType,
-        varint::VarInt,
+        varint::{BufMutExt, VarInt},
     },
     quic::{
         self, BidiStream, ConnectionErrorIncoming, RecvStream, SendStream, SendStreamUnframed,
@@ -185,6 +185,8 @@ where
 
 pub enum UniStreamHeader {
     Control(Settings),
+    /// A push stream, with its push ID
+    Push(u64),
     WebTransportUni(SessionId),
     Encoder,
     Decoder,
@@ -196,6 +198,10 @@ impl Encode for UniStreamHeader {
             Self::Control(settings) => {
                 StreamType::CONTROL.encode(buf);
                 settings.encode(buf);
+            }
+            Self::Push(push_id) => {
+                StreamType::PUSH.encode(buf);
+                buf.write_var(*push_id);
             }
             Self::WebTransportUni(session_id) => {
                 StreamType::WEBTRANSPORT_UNI.encode(buf);

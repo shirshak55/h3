@@ -27,8 +27,11 @@ use http::{response, HeaderMap, Response};
 use quic::StreamId;
 
 use crate::{
-    ext::HeaderOrder,
-    proto::{frame::Frame, headers::Header},
+    ext::{HeaderOrder, PseudoOrder},
+    proto::{
+        frame::{Frame, PushPromise},
+        headers::Header,
+    },
     quic::SendStream as _,
     stream::{self},
 };
@@ -188,6 +191,70 @@ where
             .await
             .map_err(|e| self.handle_quic_stream_error(e))?;
 
+        Ok(())
+    }
+
+    /// Promise the push `push_id` (see [`super::PushOpener::allocate_push_id`]) of
+    /// `request`'s response: a PUSH_PROMISE on this stream, the request's fields in the order
+    /// its [`HeaderOrder`] and [`PseudoOrder`] give. Its response goes on the push stream
+    /// [`super::PushOpener::open_push_stream`] opens.
+    pub async fn push_promise(
+        &mut self,
+        push_id: u64,
+        request: &http::Request<()>,
+    ) -> Result<(), StreamError> {
+        let mut headers = Header::request(
+            request.method().clone(),
+            request.uri().clone(),
+            request.headers().clone(),
+            request.extensions().clone(),
+        )
+        .map_err(|_e| {
+            self.handle_connection_error_on_stream(InternalConnectionError {
+                code: Code::H3_INTERNAL_ERROR,
+                message: "Failed to build the promised request's headers".to_string(),
+            })
+        })?;
+        if let Some(order) = request.extensions().get::<HeaderOrder>() {
+            headers.set_order(order.clone());
+        }
+        if let Some(order) = request.extensions().get::<PseudoOrder>() {
+            headers.set_pseudo_order(order.clone());
+        }
+
+        let mut block = BytesMut::new();
+        let max_mem_size = self.inner.settings().max_field_section_size;
+        let mem_size = self
+            .inner
+            .conn_state
+            .encode(
+                self.inner.stream.send_id().into_inner(),
+                headers,
+                &mut block,
+                max_mem_size,
+            )
+            .map_err(|_e| {
+                self.handle_connection_error_on_stream(InternalConnectionError {
+                    code: Code::H3_INTERNAL_ERROR,
+                    message: "Failed to encode the promised request".to_string(),
+                })
+            })?;
+        if mem_size > max_mem_size {
+            return Err(StreamError::HeaderTooBig {
+                actual_size: mem_size,
+                max_size: max_mem_size,
+            });
+        }
+
+        stream::write(
+            &mut self.inner.stream,
+            Frame::PushPromise(PushPromise {
+                id: push_id,
+                encoded: block.freeze(),
+            }),
+        )
+        .await
+        .map_err(|e| self.handle_quic_stream_error(e))?;
         Ok(())
     }
 
