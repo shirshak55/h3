@@ -387,6 +387,27 @@ where
         let mut stream_stopped = None;
 
         loop {
+            // A varint buffered whole (a push stream's push ID, read with its type) is taken
+            // without waiting for more of the stream.
+            let mut buf = self.stream.buf_mut();
+            if self.expected.is_none() && buf.remaining() >= 1 {
+                self.expected = Some(VarInt::encoded_size(buf.chunk()[0]));
+            }
+
+            if let Some(expected) = self.expected {
+                if buf.remaining() >= expected {
+                    self.expected = None;
+                    let reult = VarInt::decode(&mut buf).map_err(|_| {
+                        PollTypeError::InternalError(InternalConnectionError::new(
+                            Code::H3_INTERNAL_ERROR,
+                            "Unexpected end parsing varint".to_string(),
+                        ))
+                    })?;
+
+                    return Poll::Ready(Ok((reult, stream_stopped)));
+                }
+            }
+
             if stream_stopped.is_some() {
                 return Poll::Ready(Err(PollTypeError::EndOfStream));
             }
@@ -410,28 +431,6 @@ where
                     Some(StreamEnd::Other)
                 }
             };
-
-            let mut buf = self.stream.buf_mut();
-            if self.expected.is_none() && buf.remaining() >= 1 {
-                self.expected = Some(VarInt::encoded_size(buf.chunk()[0]));
-            }
-
-            if let Some(expected) = self.expected {
-                if buf.remaining() < expected {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-
-            let reult = VarInt::decode(&mut buf).map_err(|_| {
-                PollTypeError::InternalError(InternalConnectionError::new(
-                    Code::H3_INTERNAL_ERROR,
-                    "Unexpected end parsing varint".to_string(),
-                ))
-            })?;
-
-            return Poll::Ready(Ok((reult, stream_stopped)));
         }
     }
 
