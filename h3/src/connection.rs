@@ -874,6 +874,13 @@ where
                 continue;
             }
             let frame = ControlFrame::parse(ty, len, payload);
+            // Applied before the frame is broadcast, so a subscriber woken by it finds the
+            // push IDs it allows.
+            if let ControlFrame::MaxPushId(max) = frame {
+                if let Err(error) = self.shared.set_peer_max_push_id(max) {
+                    return Poll::Ready(Err(self.handle_connection_error(error)));
+                }
+            }
             if let Some(tx) = &self.control_frames_tx {
                 let _ = tx.send(frame.clone());
             }

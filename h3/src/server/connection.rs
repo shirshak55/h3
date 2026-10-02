@@ -303,11 +303,8 @@ where
             //# ID; receipt of a MAX_PUSH_ID frame that contains a smaller value than
             //# previously received MUST be treated as a connection error of type
             //# H3_ID_ERROR.
-            &Frame::MaxPushId(id) => {
-                if let Err(error) = self.inner.shared.set_peer_max_push_id(id.0) {
-                    return Poll::Ready(Err(self.inner.handle_connection_error(error)));
-                }
-            }
+            // Applied in `poll_control`, ahead of the frame's broadcast.
+            Frame::MaxPushId(_) => (),
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
             //# If a server receives a CANCEL_PUSH frame for a push
             //# ID that has not yet been mentioned by a PUSH_PROMISE frame, this MUST

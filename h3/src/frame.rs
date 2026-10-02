@@ -26,6 +26,8 @@ pub struct FrameStream<S, B> {
     // Already read data from the stream
     decoder: FrameDecoder,
     remaining_data: usize,
+    /// Whether the last frame read was a zero-length DATA frame, yielded as an empty chunk
+    empty_data: bool,
     /// The stream's error, read while data was still buffered
     error: Option<FrameStreamError>,
 }
@@ -36,6 +38,7 @@ impl<S, B> FrameStream<S, B> {
             stream,
             decoder: FrameDecoder::default(),
             remaining_data: 0,
+            empty_data: false,
             error: None,
         }
     }
@@ -82,12 +85,14 @@ where
             "There is still data to read, please call poll_data() until it returns None."
         );
 
+        self.empty_data = false;
         // A frame already buffered goes first: the stream's next read may be its reset
         let mut end = Poll::Ready(false);
         loop {
             return match self.decoder.decode(self.stream.buf_mut())? {
                 Some(Frame::Data(PayloadLen(len))) => {
                     self.remaining_data = len;
+                    self.empty_data = len == 0;
                     Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))))
                 }
                 frame @ Some(Frame::WebTransportStream(_)) => {
@@ -125,7 +130,7 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
         if self.remaining_data == 0 {
-            return Poll::Ready(Ok(None));
+            return Poll::Ready(Ok(std::mem::take(&mut self.empty_data).then(Bytes::new)));
         };
 
         let end = match self.try_recv(cx) {
@@ -230,12 +235,14 @@ where
                 stream: send,
                 decoder: FrameDecoder::default(),
                 remaining_data: 0,
+                empty_data: false,
                 error: None,
             },
             FrameStream {
                 stream: recv,
                 decoder: self.decoder,
                 remaining_data: self.remaining_data,
+                empty_data: self.empty_data,
                 error: self.error,
             },
         )
