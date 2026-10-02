@@ -78,6 +78,8 @@ struct PushSeen {
     promise: Option<u64>,
     /// Its push stream arrived
     streamed: bool,
+    /// This client sent CANCEL_PUSH for it
+    cancelled: bool,
 }
 
 /// What a request stream hands the connection driver about pushes
@@ -239,6 +241,25 @@ impl SharedState {
             pushes.events.push(PushEvent::Stream { push_id, stream });
         }
         first
+    }
+
+    /// Queues CANCEL_PUSH for `push_id` unless this client sent one already.
+    pub(crate) fn cancel_push(&self, push_id: u64) {
+        let first = !std::mem::replace(
+            &mut self.pushes_lock().ids.entry(push_id).or_default().cancelled,
+            true,
+        );
+        if first {
+            self.send_control_frame(&ControlFrame::CancelPush(push_id));
+        }
+    }
+
+    /// Whether this client sent CANCEL_PUSH for `push_id`.
+    pub(crate) fn push_cancelled(&self, push_id: u64) -> bool {
+        self.pushes_lock()
+            .ids
+            .get(&push_id)
+            .is_some_and(|seen| seen.cancelled)
     }
 
     /// A PUSH_PROMISE decoded on the request stream `stream`, checked against MAX_PUSH_ID and

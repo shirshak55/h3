@@ -723,7 +723,9 @@ where
                 format!("push stream {id} repeats push ID {push_id}"),
             )));
         }
-        if self.cancelled_pushes.remove(&push_id) {
+        // The server cancelled the push before its promise arrived, or this client cancelled
+        // it.
+        if self.cancelled_pushes.remove(&push_id) || self.shared.push_cancelled(push_id) {
             self.stop_push_stream(stream);
             return Ok(());
         }

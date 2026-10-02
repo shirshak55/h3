@@ -303,6 +303,20 @@ where
             })
     }
 
+    /// Sends CANCEL_PUSH for `push_id`, a push the server promised, unless this client sent
+    /// one already: a push stream arriving after is stopped (H3_REQUEST_CANCELLED), while one
+    /// already taken ([`super::PushedResponse`]) is left to the caller. Fails once the
+    /// connection failed. The connection driver writes it.
+    pub fn cancel_push(&self, push_id: u64) -> Result<(), StreamError> {
+        if let Some(error) = self.get_conn_error() {
+            return Err(StreamError::ConnectionError(convert_to_connection_error(
+                error,
+            )));
+        }
+        self.conn_state.cancel_push(push_id);
+        Ok(())
+    }
+
     /// Resolves once the control-stream frames queued so far (a
     /// [`send_priority_update`](Self::send_priority_update)) reached the transport, so a
     /// request sent after it goes out after them.

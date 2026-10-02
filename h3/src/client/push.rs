@@ -13,7 +13,6 @@ use tokio::sync::oneshot;
 use crate::{
     connection,
     error::{connection_error_creators::convert_to_connection_error, Code, StreamError},
-    ext::ControlFrame,
     frame::FrameStream,
     quic::{self, StreamId},
     shared_state::{ConnectionState, QpackStreamEnd, SharedState},
@@ -180,21 +179,26 @@ where
     R: quic::RecvStream,
 {
     fn drop(&mut self) {
-        match &mut self.stream {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
-            //# The
-            //# client SHOULD abort reading the stream with an error code of
-            //# H3_REQUEST_CANCELLED.
-            PushStream::Arrived(Some(stream)) => {
-                stream.stop_sending(Code::H3_REQUEST_CANCELLED);
-                self.shared.qpack().cancel_stream(stream.id().into_inner());
-                self.shared.waker().wake();
-            }
-            PushStream::Awaited(_) => {
-                self.shared
-                    .send_control_frame(&ControlFrame::CancelPush(self.push_id));
-            }
-            PushStream::Arrived(None) | PushStream::Taken => (),
+        let stream = match &mut self.stream {
+            PushStream::Arrived(stream) => stream.take(),
+            // Its push stream may have arrived since it was last polled.
+            PushStream::Awaited(stream) => match stream.try_recv() {
+                Ok(stream) => Some(stream),
+                Err(_) => {
+                    self.shared.cancel_push(self.push_id);
+                    None
+                }
+            },
+            PushStream::Taken => None,
+        };
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+        //# The
+        //# client SHOULD abort reading the stream with an error code of
+        //# H3_REQUEST_CANCELLED.
+        if let Some(mut stream) = stream {
+            stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+            self.shared.qpack().cancel_stream(stream.id().into_inner());
+            self.shared.waker().wake();
         }
     }
 }
