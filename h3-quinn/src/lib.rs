@@ -383,6 +383,14 @@ impl<B: Buf> quic::RecvStream for BidiStream<B> {
         self.recv.stop_sending(error_code)
     }
 
+    fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        error_code: u64,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.recv.poll_stop_and_await_end(cx, error_code)
+    }
+
     fn recv_id(&self) -> StreamId {
         self.recv.recv_id()
     }
@@ -473,6 +481,30 @@ impl quic::RecvStream for RecvStream {
         self.stream
             .stop(VarInt::from_u64(error_code).expect("invalid error_code"))
             .ok();
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        error_code: u64,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        let ended = ready!(self.stream.poll_stop_and_await_end(
+            cx,
+            VarInt::from_u64(error_code).expect("invalid error_code"),
+        ));
+        Poll::Ready(
+            ended
+                .map(|code| code.map(VarInt::into_inner))
+                .map_err(|error| match error {
+                    quinn::ResetError::ConnectionLost(connection_error) => {
+                        StreamErrorIncoming::ConnectionErrorIncoming {
+                            connection_error: convert_connection_error(connection_error),
+                        }
+                    }
+                    error @ quinn::ResetError::ZeroRttRejected => zero_rtt_rejected(error),
+                }),
+        )
     }
 
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]

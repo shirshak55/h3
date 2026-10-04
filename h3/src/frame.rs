@@ -171,6 +171,16 @@ where
         self.stream.stop_sending(error_code.into());
     }
 
+    /// Stops the underlying stream with the provided error code, then polls for how the peer
+    /// ends it (see [`RecvStream::poll_stop_and_await_end`])
+    pub(crate) fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut Context<'_>,
+        error_code: Code,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.stream.poll_stop_and_await_end(cx, error_code.into())
+    }
+
     pub(crate) fn has_data(&self) -> bool {
         self.remaining_data != 0
     }
@@ -700,6 +710,14 @@ mod tests {
         }
 
         fn stop_sending(&mut self, _: u64) {
+            unimplemented!()
+        }
+
+        fn poll_stop_and_await_end(
+            &mut self,
+            _: &mut Context<'_>,
+            _: u64,
+        ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
             unimplemented!()
         }
 

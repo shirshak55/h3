@@ -226,6 +226,15 @@ pub trait RecvStream {
     /// Send a `STOP_SENDING` QUIC code.
     fn stop_sending(&mut self, error_code: u64);
 
+    /// Send a `STOP_SENDING` QUIC code as [`stop_sending`](Self::stop_sending) does on the first
+    /// call, then poll for how the peer ends the stream: `Some` with its reset's code, `None` if
+    /// it sent all of the stream (or all of it was read).
+    fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        error_code: u64,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>>;
+
     /// Get QUIC send stream id
     fn recv_id(&self) -> StreamId;
 }

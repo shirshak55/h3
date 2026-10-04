@@ -41,6 +41,14 @@ where
         self.stream.stop_sending(error_code)
     }
 
+    fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        error_code: u64,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.stream.poll_stop_and_await_end(cx, error_code)
+    }
+
     fn recv_id(&self) -> quic::StreamId {
         self.stream.recv_id()
     }
@@ -284,6 +292,14 @@ impl<S: quic::RecvStream, B> quic::RecvStream for BidiStream<S, B> {
 
     fn stop_sending(&mut self, error_code: u64) {
         self.stream.stop_sending(error_code)
+    }
+
+    fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        error_code: u64,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.stream.poll_stop_and_await_end(cx, error_code)
     }
 
     fn recv_id(&self) -> quic::StreamId {
