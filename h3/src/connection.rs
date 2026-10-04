@@ -979,13 +979,23 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Frame<PayloadLen>, ConnectionError>> {
         // check if a connection error occurred on a stream
-        let _ = self.poll_connection_error(cx)?;
+        let checked = match self.poll_connection_error(cx) {
+            Poll::Ready(Err(error)) => Err(error),
+            _ => self
+                .poll_accept_recv(cx)
+                .and_then(|()| self.poll_qpack(cx))
+                .and_then(|()| self.poll_control_send(cx)),
+        };
+        // The peer closing the connection: the control-stream frames it sent before are read
+        // first, as they arrived before its close.
+        let closed = match checked {
+            Err(error @ ConnectionError::Remote(_)) if self.control_recv.is_some() => Some(error),
+            Err(error) => return Poll::Ready(Err(error)),
+            Ok(()) => None,
+        };
 
         let recv = {
             // TODO
-            self.poll_accept_recv(cx)?;
-            self.poll_qpack(cx)?;
-            self.poll_control_send(cx)?;
             self.poll_pushes();
             if let Some(v) = &mut self.control_recv {
                 v
@@ -1006,7 +1016,10 @@ where
         }
         if let Some((_, held)) = &self.control_frames_tx {
             if !held.poll_room(cx) {
-                return Poll::Pending;
+                return match closed {
+                    Some(error) => Poll::Ready(Err(error)),
+                    None => Poll::Pending,
+                };
             }
         }
 
@@ -1041,6 +1054,10 @@ where
                     held.release(&unsent.0);
                 }
             }
+        }
+
+        if let Some(error) = closed.filter(|_| !matches!(polled, Poll::Ready(Ok(Some(_))))) {
+            return Poll::Ready(Err(error));
         }
 
         let res = match ready!(polled) {
