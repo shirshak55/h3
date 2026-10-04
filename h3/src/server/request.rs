@@ -26,6 +26,19 @@ use crate::{
 
 use super::{connection::RequestEnd, stream::RequestStream};
 
+/// A bidirectional stream the client opened, its first frame read (see
+/// [`RequestResolver::resolve_stream`])
+pub enum ResolvedStream<C, B>
+where
+    C: quic::Connection<B>,
+    B: Buf,
+{
+    /// A request
+    Request(Request<()>, RequestStream<C::BidiStream, B>),
+    /// A WebTransport stream
+    WebTransport(crate::ext::WebTransportStream<C::BidiStream, C::RecvStream>),
+}
+
 /// Helper struct to await the request headers and return a `Request` object
 pub struct RequestResolver<C, B>
 where
@@ -74,6 +87,27 @@ where
         let frame = std::future::poll_fn(|cx| self.frame_stream.poll_next(cx)).await;
         let req = self.accept_with_frame(frame)?;
         Ok(req.resolve().await?)
+    }
+
+    /// Awaits the stream's first frame: the request headers, resolved into a `Request`, or a
+    /// WEBTRANSPORT_STREAM signal, the stream handed over as a WebTransport stream whether
+    /// or not WebTransport was negotiated
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn resolve_stream(mut self) -> Result<ResolvedStream<C, B>, StreamError> {
+        let frame = std::future::poll_fn(|cx| self.frame_stream.poll_next(cx)).await;
+        if let Ok(Some(Frame::WebTransportStream(session_id))) = frame {
+            let (read, finished, stream) = self.frame_stream.into_inner().into_parts();
+            return Ok(ResolvedStream::WebTransport(
+                crate::ext::WebTransportStream::Bidi {
+                    session_id: session_id.into_inner(),
+                    read,
+                    finished,
+                    stream,
+                },
+            ));
+        }
+        let (request, stream) = self.accept_with_frame(frame)?.resolve().await?;
+        Ok(ResolvedStream::Request(request, stream))
     }
 
     /// Accepts a http request where the first frame has already been read and decoded.

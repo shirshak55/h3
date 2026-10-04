@@ -192,6 +192,18 @@ where
         self.inner.subscribe_control_frames()
     }
 
+    /// Receives the unidirectional WebTransport streams the client opens from now on, as
+    /// [`Connection::accept`] reads their headers, whether or not WebTransport was
+    /// negotiated, replacing any previous receiver. Its bidirectional ones come from
+    /// [`super::RequestResolver::resolve_stream`].
+    pub fn subscribe_webtransport(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<
+        crate::ext::WebTransportStream<C::BidiStream, C::RecvStream>,
+    > {
+        self.inner.subscribe_webtransport()
+    }
+
     /// How the client used its QPACK encoder stream so far: the dynamic table capacities it set,
     /// its inserts, and the field sections that referenced the table or waited for it. `None`
     /// unless this server advertises a dynamic table ([`super::Builder::qpack_max_table_capacity`]),

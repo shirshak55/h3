@@ -25,7 +25,7 @@ use crate::{
         internal_error::{ErrorOrigin, InternalConnectionError},
         Code, ConnectionError, StreamError,
     },
-    ext::{ControlFrame, HeaderOrder},
+    ext::{ControlFrame, HeaderOrder, WebTransportStream},
     frame::{FrameStream, FrameStreamError},
     proto::{
         coding::Encode,
@@ -125,6 +125,11 @@ where
     peer_control_frames: Vec<ControlFrame>,
     /// Receives every frame after SETTINGS on the peer's control stream
     control_frames_tx: Option<mpsc::UnboundedSender<ControlFrame>>,
+    /// Receives the WebTransport streams the peer opens
+    webtransport_tx:
+        Option<mpsc::UnboundedSender<WebTransportStream<C::BidiStream, C::RecvStream>>>,
+    /// The server's bidirectional streams whose WEBTRANSPORT_STREAM signal is being read
+    webtransport_bidi: Vec<FrameStream<C::BidiStream, B>>,
     /// Decoding with a QPACK dynamic table: the peer's encoder stream is read
     qpack_decoding: bool,
     /// Decoder-stream instructions being written
@@ -383,6 +388,8 @@ where
             peer_uni_streams: Vec::new(),
             peer_control_frames: Vec::new(),
             control_frames_tx: None,
+            webtransport_tx: None,
+            webtransport_bidi: Vec::new(),
             qpack_decoding: config.settings.qpack_max_table_capacity > 0,
             decoder_queue: Queued::default(),
             qpack_encoding: config.qpack_encoder_capacity > 0,
@@ -653,6 +660,18 @@ where
                     self.shared.qpack().cancel_stream(id.into_inner());
                     self.shared.push_stream(push_id, id);
                 }
+                // A stream no one receives any more is dropped, which stops it.
+                AcceptedRecvStream::WebTransportUni(id, s) if self.webtransport_tx.is_some() => {
+                    let (read, finished, stream) = s.into_parts();
+                    if let Some(tx) = &self.webtransport_tx {
+                        let _ = tx.send(WebTransportStream::Uni {
+                            session_id: id.into_inner(),
+                            read,
+                            finished,
+                            stream,
+                        });
+                    }
+                }
                 AcceptedRecvStream::WebTransportUni(id, s)
                     if self.config.settings.enable_webtransport =>
                 {
@@ -843,6 +862,62 @@ where
         let (tx, rx) = mpsc::unbounded_channel();
         self.pushes_tx = Some(tx);
         rx
+    }
+
+    /// Receives the WebTransport streams the peer opens from now on, whether or not
+    /// WebTransport was negotiated, replacing any previous receiver: unidirectional ones
+    /// (and, on a client, the server's bidirectional ones) as the connection reads their
+    /// headers.
+    pub fn subscribe_webtransport(
+        &mut self,
+    ) -> mpsc::UnboundedReceiver<WebTransportStream<C::BidiStream, C::RecvStream>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.webtransport_tx = Some(tx);
+        rx
+    }
+
+    /// Whether WebTransport streams go to a subscriber ([`Self::subscribe_webtransport`])
+    pub(crate) fn delivers_webtransport(&self) -> bool {
+        self.webtransport_tx.is_some()
+    }
+
+    /// Accepts the server's bidirectional streams, which only WebTransport opens, and hands
+    /// each to the subscriber once its WEBTRANSPORT_STREAM signal is read. Another first
+    /// frame is a connection error.
+    pub(crate) fn poll_webtransport_bidi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<(), ConnectionError> {
+        while let Poll::Ready(stream) = self.poll_accept_bi(cx) {
+            self.webtransport_bidi
+                .push(FrameStream::new(BufRecvStream::new(stream?)));
+        }
+        let mut index = 0;
+        while index < self.webtransport_bidi.len() {
+            match self.webtransport_bidi[index].poll_next(cx) {
+                Poll::Pending => index += 1,
+                Poll::Ready(Ok(Some(Frame::WebTransportStream(session_id)))) => {
+                    let stream = self.webtransport_bidi.swap_remove(index);
+                    let (read, finished, stream) = stream.into_inner().into_parts();
+                    if let Some(tx) = &self.webtransport_tx {
+                        let _ = tx.send(WebTransportStream::Bidi {
+                            session_id: session_id.into_inner(),
+                            read,
+                            finished,
+                            stream,
+                        });
+                    }
+                }
+                Poll::Ready(_) => {
+                    return Err(self.handle_connection_error(InternalConnectionError::new(
+                        Code::H3_STREAM_CREATION_ERROR,
+                        "client received a server-initiated bidirectional stream other than WebTransport"
+                            .to_string(),
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Waits for the control stream to be received and reads subsequent frames.

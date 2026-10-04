@@ -442,6 +442,12 @@ impl RecvStream {
     fn new(stream: quinn::RecvStream) -> Self {
         Self { stream, read: None }
     }
+
+    /// The quinn stream, with the bytes read before this stream was handed over that it
+    /// hasn't returned yet
+    pub fn into_inner(self) -> (Option<Bytes>, quinn::RecvStream) {
+        (self.read, self.stream)
+    }
 }
 
 impl quic::RecvStream for RecvStream {
@@ -545,6 +551,11 @@ where
             writing: None,
             sent: 0,
         }
+    }
+
+    /// The quinn stream, once what was being written is: `None` while a write is pending
+    pub fn into_inner(self) -> Option<quinn::SendStream> {
+        self.writing.is_none().then_some(self.stream)
     }
 }
 

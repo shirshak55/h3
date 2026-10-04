@@ -558,6 +558,12 @@ impl<B, S: RecvStream> BufRecvStream<S, B> {
     pub fn is_eos(&self) -> bool {
         self.eos
     }
+
+    /// The bytes buffered, whether the stream had ended, and the stream
+    pub(crate) fn into_parts(mut self) -> (Bytes, bool, S) {
+        let read = self.buf.copy_to_bytes(self.buf.remaining());
+        (read, self.eos, self.stream)
+    }
 }
 
 impl<S: RecvStream, B> RecvStream for BufRecvStream<S, B> {

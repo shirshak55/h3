@@ -1,6 +1,6 @@
 //! Extensions for the HTTP/3 protocol.
 
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
 use bytes::{Buf, BufMut, Bytes};
 use http::HeaderName;
@@ -10,35 +10,27 @@ use crate::{
     quic::StreamId,
 };
 
-/// Describes the `:protocol` pseudo-header for extended connect
+/// Describes the `:protocol` pseudo-header for extended connect: any protocol token, such
+/// as `websocket` (RFC 9220), `webtransport` or `connect-udp` (RFC 9298)
 ///
 /// See: <https://www.rfc-editor.org/rfc/rfc8441#section-4>
-#[derive(Copy, PartialEq, Debug, Clone)]
-pub struct Protocol(ProtocolInner);
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
+pub struct Protocol(Cow<'static, str>);
 
 impl Protocol {
     /// WebTransport protocol
-    pub const WEB_TRANSPORT: Protocol = Protocol(ProtocolInner::WebTransport);
+    pub const WEB_TRANSPORT: Protocol = Protocol(Cow::Borrowed("webtransport"));
     /// RFC 9298 protocol
-    pub const CONNECT_UDP: Protocol = Protocol(ProtocolInner::ConnectUdp);
+    pub const CONNECT_UDP: Protocol = Protocol(Cow::Borrowed("connect-udp"));
 
     /// Return a &str representation of the `:protocol` pseudo-header value
     #[inline]
     pub fn as_str(&self) -> &str {
-        match self.0 {
-            ProtocolInner::WebTransport => "webtransport",
-            ProtocolInner::ConnectUdp => "connect-udp",
-        }
+        &self.0
     }
 }
 
-#[derive(Copy, PartialEq, Debug, Clone)]
-enum ProtocolInner {
-    WebTransport,
-    ConnectUdp,
-}
-
-/// Error when parsing the protocol
+/// Error when parsing the protocol: an empty value
 pub struct InvalidProtocol;
 
 impl FromStr for Protocol {
@@ -46,11 +38,38 @@ impl FromStr for Protocol {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "webtransport" => Ok(Self(ProtocolInner::WebTransport)),
-            "connect-udp" => Ok(Self(ProtocolInner::ConnectUdp)),
-            _ => Err(InvalidProtocol),
+            "" => Err(InvalidProtocol),
+            s => Ok(Self(Cow::Owned(s.to_owned()))),
         }
     }
+}
+
+/// A WebTransport stream (draft-ietf-webtrans-http3) the peer opened, handed over with its
+/// header read: the session it belongs to (the ID of its CONNECT request's stream), the
+/// bytes read past the header, and whether the stream had ended by then
+pub enum WebTransportStream<Bidi, Recv> {
+    /// A bidirectional stream, its WEBTRANSPORT_STREAM signal read
+    Bidi {
+        /// Its session's CONNECT stream ID
+        session_id: u64,
+        /// The bytes read past the header
+        read: Bytes,
+        /// Whether the peer had finished the stream
+        finished: bool,
+        /// The stream
+        stream: Bidi,
+    },
+    /// A unidirectional stream, its stream type read
+    Uni {
+        /// Its session's CONNECT stream ID
+        session_id: u64,
+        /// The bytes read past the header
+        read: Bytes,
+        /// Whether the peer had finished the stream
+        finished: bool,
+        /// The stream
+        stream: Recv,
+    },
 }
 
 /// The names of a message's header fields in the order its field section carries them,

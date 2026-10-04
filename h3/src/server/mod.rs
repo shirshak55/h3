@@ -57,5 +57,5 @@ pub use builder::builder;
 pub use builder::Builder;
 pub use connection::Connection;
 pub use push::PushOpener;
-pub use request::RequestResolver;
+pub use request::{RequestResolver, ResolvedStream};
 pub use stream::RequestStream;

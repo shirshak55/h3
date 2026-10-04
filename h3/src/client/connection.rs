@@ -520,6 +520,17 @@ where
         self.inner.subscribe_control_frames()
     }
 
+    /// Receives the WebTransport streams the server opens from now on, bidirectional and
+    /// unidirectional, whether or not WebTransport was negotiated, replacing any previous
+    /// receiver. The connection must be driven (polled) for them to arrive.
+    pub fn subscribe_webtransport(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<
+        crate::ext::WebTransportStream<C::BidiStream, C::RecvStream>,
+    > {
+        self.inner.subscribe_webtransport()
+    }
+
     /// How the server used its QPACK encoder stream so far. `None` unless this client
     /// advertises a dynamic table, as the encoder stream is only read then.
     pub fn peer_qpack_encoder(&self) -> Option<crate::ext::QpackEncoderUse> {
@@ -632,7 +643,11 @@ where
         //# receipt of a server-initiated bidirectional stream as a connection
         //# error of type H3_STREAM_CREATION_ERROR unless such an extension has
         //# been negotiated.
-        if self.inner.poll_accept_bi(cx).is_ready() {
+        if self.inner.delivers_webtransport() {
+            if let Err(error) = self.inner.poll_webtransport_bidi(cx) {
+                return Poll::Ready(error);
+            }
+        } else if self.inner.poll_accept_bi(cx).is_ready() {
             return Poll::Ready(
                 self.inner
                     .handle_connection_error(InternalConnectionError::new(
