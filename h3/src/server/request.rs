@@ -96,6 +96,10 @@ where
     pub async fn resolve_stream(mut self) -> Result<ResolvedStream<C, B>, StreamError> {
         let frame = std::future::poll_fn(|cx| self.frame_stream.poll_next(cx)).await;
         if let Ok(Some(Frame::WebTransportStream(session_id))) = frame {
+            // No field section comes on it: no QPACK Stream Cancellation is due.
+            if let Some(end) = &mut self.qpack_end {
+                end.ended = true;
+            }
             let (read, finished, stream) = self.frame_stream.into_inner().into_parts();
             return Ok(ResolvedStream::WebTransport(
                 crate::ext::WebTransportStream::Bidi {

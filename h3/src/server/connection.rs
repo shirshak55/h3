@@ -250,6 +250,14 @@ where
         self.inner.shutdown(&mut self.sent_closing, max_id).await
     }
 
+    /// Initiate a graceful shutdown with a GOAWAY naming `id`, which may name a request stream
+    /// accepted already: requests from it on are rejected (H3_REQUEST_REJECTED) as they arrive,
+    /// and those accepted are the application's to leave unprocessed
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn shutdown_at(&mut self, id: StreamId) -> Result<(), ConnectionError> {
+        self.inner.shutdown(&mut self.sent_closing, id).await
+    }
+
     /// Accepts an incoming bidirectional stream.
     ///
     /// This could be either a *Request* or a *WebTransportBiStream*, the first frame's type
