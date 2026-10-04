@@ -57,6 +57,14 @@ impl InternalConnectionError {
             //# after the identified fields or a frame payload that terminates before
             //# the end of the identified fields MUST be treated as a connection
             //# error of type H3_FRAME_ERROR.
+            FrameProtocolError::TooLarge(ty) => InternalConnectionError {
+                code: Code::H3_EXCESSIVE_LOAD,
+                message: format!(
+                    "control stream frame 0x{:x} longer than {} bytes",
+                    ty,
+                    crate::frame::MAX_KEPT_FRAME
+                ),
+            },
             FrameProtocolError::InvalidFrameValue | FrameProtocolError::Malformed => InternalConnectionError {
                 code: Code::H3_FRAME_ERROR,
                 message: "frame payload that contains additional bytes after the identified fields or a frame payload that terminates before the end of the identified fields".to_string(),

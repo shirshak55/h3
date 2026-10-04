@@ -25,7 +25,9 @@ use crate::{
         internal_error::{ErrorOrigin, InternalConnectionError},
         Code, ConnectionError, StreamError,
     },
-    ext::{ControlFrame, HeaderOrder, WebTransportStream},
+    ext::{
+        ControlFrame, ControlFrames, HeaderOrder, HeldFrames, UnknownStream, WebTransportStream,
+    },
     frame::{FrameStream, FrameStreamError},
     proto::{
         coding::Encode,
@@ -43,6 +45,9 @@ use crate::{
 
 /// How many of the peer's unidirectional streams and control frames are recorded.
 const PEER_RECORD_LIMIT: usize = 16;
+
+/// How many payload bytes the peer's control frames recorded may hold.
+const PEER_RECORD_BYTES: usize = 64 * 1024;
 
 #[allow(missing_docs)]
 pub struct AcceptedStreams<C, B>
@@ -123,8 +128,12 @@ where
     peer_uni_streams: Vec<(StreamId, u64)>,
     /// The first frames after SETTINGS on the peer's control stream
     peer_control_frames: Vec<ControlFrame>,
+    /// Whether the next of those is recorded: none is once one was not
+    recording_control_frames: bool,
     /// Receives every frame after SETTINGS on the peer's control stream
-    control_frames_tx: Option<mpsc::UnboundedSender<ControlFrame>>,
+    control_frames_tx: Option<(mpsc::UnboundedSender<ControlFrame>, Arc<HeldFrames>)>,
+    /// Receives the unidirectional streams of unknown types the peer opens
+    unknown_streams_tx: Option<mpsc::UnboundedSender<UnknownStream<C::RecvStream>>>,
     /// Receives the WebTransport streams the peer opens
     webtransport_tx:
         Option<mpsc::UnboundedSender<WebTransportStream<C::BidiStream, C::RecvStream>>>,
@@ -387,7 +396,9 @@ where
             peer_settings: None,
             peer_uni_streams: Vec::new(),
             peer_control_frames: Vec::new(),
+            recording_control_frames: true,
             control_frames_tx: None,
+            unknown_streams_tx: None,
             webtransport_tx: None,
             webtransport_bidi: Vec::new(),
             qpack_decoding: config.settings.qpack_max_table_capacity > 0,
@@ -611,6 +622,7 @@ where
                 Poll::Pending => continue,
             };
 
+            let (_, ty) = resolved.id_and_type();
             if self.peer_uni_streams.len() < PEER_RECORD_LIMIT {
                 self.peer_uni_streams.push(resolved.id_and_type());
             }
@@ -684,6 +696,21 @@ where
                 //= type=implication
                 //# Endpoints MUST NOT consider these streams to have any meaning upon
                 //# receipt.
+                AcceptedRecvStream::Unknown(stream) if self.unknown_streams_tx.is_some() => {
+                    let (read, finished, stream) = stream.into_parts();
+                    let unknown = UnknownStream {
+                        ty,
+                        read,
+                        finished,
+                        stream,
+                    };
+                    if let Some(Err(unsent)) =
+                        self.unknown_streams_tx.as_ref().map(|tx| tx.send(unknown))
+                    {
+                        let mut stream = unsent.0.stream;
+                        stream.stop_sending(Code::H3_STREAM_CREATION_ERROR.value());
+                    }
+                }
                 AcceptedRecvStream::Unknown(mut stream) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
                     //# Recipients of unknown stream types MUST
@@ -876,6 +903,18 @@ where
         rx
     }
 
+    /// Receives the unidirectional streams of types HTTP/3 doesn't know (reserved (GREASE)
+    /// ones among them) the peer opens from now on, replacing any previous receiver, rather
+    /// than stopping them (H3_STREAM_CREATION_ERROR), as RFC 9114 §6.2 lets a receiver
+    /// either stop or ignore them.
+    pub fn subscribe_unknown_streams(
+        &mut self,
+    ) -> mpsc::UnboundedReceiver<UnknownStream<C::RecvStream>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.unknown_streams_tx = Some(tx);
+        rx
+    }
+
     /// Whether WebTransport streams go to a subscriber ([`Self::subscribe_webtransport`])
     pub(crate) fn delivers_webtransport(&self) -> bool {
         self.webtransport_tx.is_some()
@@ -908,6 +947,19 @@ where
                         });
                     }
                 }
+                // Ended or reset before its signal: only that stream ends.
+                Poll::Ready(
+                    Ok(None)
+                    | Err(
+                        FrameStreamError::UnexpectedEnd
+                        | FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated { .. }),
+                    ),
+                ) => {
+                    drop(self.webtransport_bidi.swap_remove(index));
+                }
+                Poll::Ready(Err(FrameStreamError::Quic(
+                    StreamErrorIncoming::ConnectionErrorIncoming { connection_error },
+                ))) => return Err(self.handle_connection_error(connection_error)),
                 Poll::Ready(_) => {
                     return Err(self.handle_connection_error(InternalConnectionError::new(
                         Code::H3_STREAM_CREATION_ERROR,
@@ -943,6 +995,21 @@ where
             }
         };
 
+        // A subscriber holding as many frames as it may: the stream is read on once it took
+        // some.
+        if self
+            .control_frames_tx
+            .as_ref()
+            .is_some_and(|(tx, _)| tx.is_closed())
+        {
+            self.control_frames_tx = None;
+        }
+        if let Some((_, held)) = &self.control_frames_tx {
+            if !held.poll_room(cx) {
+                return Poll::Pending;
+            }
+        }
+
         let polled = recv.poll_next(cx);
         for (ty, len, payload) in recv.take_frames() {
             if ty == frame::FrameType::SETTINGS.value() {
@@ -956,11 +1023,23 @@ where
                     return Poll::Ready(Err(self.handle_connection_error(error)));
                 }
             }
-            if self.peer_control_frames.len() < PEER_RECORD_LIMIT {
-                self.peer_control_frames.push(frame.recorded());
+            if self.recording_control_frames {
+                let recorded: usize = self
+                    .peer_control_frames
+                    .iter()
+                    .map(ControlFrame::size)
+                    .sum();
+                self.recording_control_frames = self.peer_control_frames.len() < PEER_RECORD_LIMIT
+                    && recorded + frame.size() <= PEER_RECORD_BYTES;
+                if self.recording_control_frames {
+                    self.peer_control_frames.push(frame.clone());
+                }
             }
-            if let Some(tx) = &self.control_frames_tx {
-                let _ = tx.send(frame);
+            if let Some((tx, held)) = &self.control_frames_tx {
+                held.hold(&frame);
+                if let Err(unsent) = tx.send(frame) {
+                    held.release(&unsent.0);
+                }
             }
         }
 
@@ -1447,11 +1526,13 @@ where
     }
 
     /// Receives every frame after SETTINGS on the peer's control stream as it is read from now
-    /// on, with its whole payload, replacing any previous receiver.
-    pub fn subscribe_control_frames(&mut self) -> mpsc::UnboundedReceiver<ControlFrame> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.control_frames_tx = Some(tx);
-        rx
+    /// on, with its whole payload, replacing any previous receiver: the stream is read only
+    /// while the receiver takes them (see [`ControlFrames`]).
+    pub fn subscribe_control_frames(&mut self) -> ControlFrames {
+        let (tx, frames) = mpsc::unbounded_channel();
+        let held = Arc::new(HeldFrames::default());
+        self.control_frames_tx = Some((tx, Arc::clone(&held)));
+        ControlFrames { frames, held }
     }
 }
 

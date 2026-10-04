@@ -266,6 +266,7 @@ impl Builder {
             max_field_section_size: inner.config.settings.max_field_section_size,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: inner.config.send_grease_frame,
+            after_goaway: false,
             _buf: PhantomData,
         };
 

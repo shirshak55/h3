@@ -20,6 +20,10 @@ use crate::{
     quic::{BidiStream, RecvStream, SendStream},
 };
 
+/// How long a payload a kept frame (see [`FrameStream::keep_frames`]) may have: it is
+/// buffered whole.
+pub(crate) const MAX_KEPT_FRAME: u64 = 1 << 20;
+
 /// Decodes Frames from the underlying QUIC stream
 pub struct FrameStream<S, B> {
     pub stream: BufRecvStream<S, B>,
@@ -58,13 +62,13 @@ impl<S, B> FrameStream<S, B> {
         &self.decoder.frame_types
     }
 
-    /// Keeps each frame read, unknown ones included, for [`FrameStream::take_frames`].
+    /// Keeps each whole frame a control stream carries, unknown ones included, for
+    /// [`FrameStream::take_frames`], and refuses one longer than [`MAX_KEPT_FRAME`].
     pub(crate) fn keep_frames(&mut self) {
         self.decoder.keep_frames = true;
     }
 
-    /// The frames read since the last call: type, payload length and payload (a DATA frame's as
-    /// far as it was buffered).
+    /// The frames kept since the last call: type, payload length and payload.
     pub(crate) fn take_frames(&mut self) -> Vec<(u64, u64, Bytes)> {
         std::mem::take(&mut self.decoder.frames)
     }
@@ -277,6 +281,18 @@ impl FrameDecoder {
                 }
             }
 
+            // A kept frame is buffered whole: one longer than that is refused.
+            if self.keep_frames {
+                let mut header = src.cursor();
+                if let (Ok(ty), Ok(len)) = (header.get_var(), header.get_var()) {
+                    let streamed = ty == frame::FrameType::DATA.value()
+                        || ty == frame::FrameType::WEBTRANSPORT_BI_STREAM.value();
+                    if !streamed && len > MAX_KEPT_FRAME {
+                        return Err(FrameStreamError::Proto(FrameProtocolError::TooLarge(ty)));
+                    }
+                }
+            }
+
             let (pos, decoded) = {
                 let mut cur = src.cursor();
                 let decoded = Frame::decode(&mut cur);
@@ -290,14 +306,22 @@ impl FrameDecoder {
                 self.frame_types.push(ty);
             }
 
-            if self.keep_frames
-                && matches!(decoded, Ok(_) | Err(frame::FrameError::UnknownFrame(_)))
-            {
+            // Only whole frames a control stream carries: a DATA or WEBTRANSPORT_STREAM header
+            // comes without its payload.
+            let whole = matches!(
+                decoded,
+                Ok(Frame::Settings(_)
+                    | Frame::CancelPush(_)
+                    | Frame::Goaway(_)
+                    | Frame::MaxPushId(_))
+                    | Err(frame::FrameError::UnknownFrame(_))
+            );
+            if self.keep_frames && whole {
                 let mut frame = src.cursor();
                 let ty = frame.get_var().expect("a decoded frame has a type");
                 let len = frame.get_var().expect("a decoded frame has a length");
-                let kept = frame.remaining().min(len as usize);
-                self.frames.push((ty, len, frame.copy_to_bytes(kept)));
+                self.frames
+                    .push((ty, len, frame.copy_to_bytes(len as usize)));
             }
 
             match decoded {
@@ -370,6 +394,8 @@ pub enum FrameProtocolError {
     Settings(SettingsError),
     InvalidStreamId(InvalidStreamId),
     InvalidPushId(InvalidPushId),
+    /// A kept frame of this type longer than [`MAX_KEPT_FRAME`]
+    TooLarge(u64),
 }
 
 #[cfg(test)]

@@ -33,6 +33,23 @@ use tracing::{instrument, trace};
 
 use super::{push::PushOpener, request::RequestResolver};
 
+/// Sends frames on a server's control stream (see [`Connection::control_sender`]).
+#[derive(Clone)]
+pub struct ControlSender(std::sync::Arc<SharedState>);
+
+impl ControlSender {
+    /// [`Connection::send_control_frame`]
+    pub fn send(&self, frame: crate::ext::ControlFrame) -> Result<(), crate::error::StreamError> {
+        self.0.send_raw_control_frame(&frame)
+    }
+
+    /// Resolves once the control-stream frames queued so far reached the transport, which
+    /// takes them as the client's flow control lets it. [`Connection::accept`] writes them.
+    pub async fn written(&self) {
+        poll_fn(|cx| self.0.poll_control_written(cx)).await
+    }
+}
+
 /// Server connection driver
 ///
 /// The [`Connection`] struct manages a connection from the side of the HTTP/3 server
@@ -176,19 +193,19 @@ where
         self.inner.peer_control_frame_types()
     }
 
-    /// The first 16 frames after SETTINGS on the client's control stream, in wire order and
-    /// with their contents: PRIORITY_UPDATE (request and push variants), MAX_PUSH_ID,
-    /// CANCEL_PUSH, GOAWAY and reserved (GREASE) or other unknown frames.
+    /// The first frames after SETTINGS on the client's control stream (up to 16, with up to
+    /// 64 KiB of payloads), in wire order and with their contents: PRIORITY_UPDATE (request
+    /// and push variants), MAX_PUSH_ID, CANCEL_PUSH, GOAWAY and reserved (GREASE) or other
+    /// unknown frames.
     pub fn peer_control_frames(&self) -> &[crate::ext::ControlFrame] {
         self.inner.peer_control_frames()
     }
 
     /// Receives every frame after SETTINGS on the client's control stream as
     /// [`Connection::accept`] reads it, from now on (a PRIORITY_UPDATE when it arrives, for
-    /// one), replacing any previous receiver. Frames are buffered until received.
-    pub fn subscribe_control_frames(
-        &mut self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::ext::ControlFrame> {
+    /// one), replacing any previous receiver. The stream is read only while the receiver takes
+    /// them (see [`crate::ext::ControlFrames`]).
+    pub fn subscribe_control_frames(&mut self) -> crate::ext::ControlFrames {
         self.inner.subscribe_control_frames()
     }
 
@@ -233,6 +250,12 @@ where
         frame: crate::ext::ControlFrame,
     ) -> Result<(), crate::error::StreamError> {
         self.inner.shared.send_raw_control_frame(&frame)
+    }
+
+    /// A handle sending frames on the control stream as [`Connection::send_control_frame`]
+    /// does, from any task, which tells when those sent reached the transport.
+    pub fn control_sender(&self) -> ControlSender {
+        ControlSender(self.inner.shared.clone())
     }
 
     /// Initiate a graceful shutdown, accepting `max_request` potentially still in-flight past

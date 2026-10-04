@@ -118,6 +118,8 @@ where
     pub(super) sender_count: Arc<AtomicUsize>,
     pub(super) _buf: PhantomData<fn(B)>,
     pub(super) send_grease_frame: bool,
+    /// See [`SendRequest::send_after_goaway`]
+    pub(super) after_goaway: bool,
 }
 
 impl<T, B> ConnectionState for SendRequest<T, B>
@@ -148,9 +150,11 @@ where
         &mut self,
         req: http::Request<()>,
     ) -> Result<RequestStream<T::BidiStream, B>, StreamError> {
-        if let Some(error) = self.check_peer_connection_closing() {
-            return Err(error);
-        };
+        if !self.after_goaway {
+            if let Some(error) = self.check_peer_connection_closing() {
+                return Err(error);
+            };
+        }
 
         let (parts, _) = req.into_parts();
         let request::Parts {
@@ -327,6 +331,13 @@ where
         self.conn_state.send_raw_control_frame(&frame)
     }
 
+    /// Lets this sender send requests after the server's GOAWAY, which the server processes
+    /// on streams below the GOAWAY's ID (RFC 9114 §5.2): those a client sent before it saw the
+    /// GOAWAY, relayed. The caller keeps them below it.
+    pub fn send_after_goaway(&mut self) {
+        self.after_goaway = true;
+    }
+
     /// Resolves once the control-stream frames queued so far (a
     /// [`send_priority_update`](Self::send_priority_update)) reached the transport, so a
     /// request sent after it goes out after them.
@@ -351,6 +362,7 @@ where
             sender_count: self.sender_count.clone(),
             _buf: PhantomData,
             send_grease_frame: self.send_grease_frame,
+            after_goaway: self.after_goaway,
         }
     }
 }
@@ -401,6 +413,7 @@ where
 /// #    C: quic::Connection<B> + Send + 'static,
 /// #    C::SendStream: Send + 'static,
 /// #    C::RecvStream: Send + 'static,
+/// #    C::BidiStream: Send + 'static,
 /// #    B: Buf + Send + 'static,
 /// # {
 /// // Run the driver on a different task
@@ -426,6 +439,7 @@ where
 /// #    C: quic::Connection<B> + Send + 'static,
 /// #    C::SendStream: Send + 'static,
 /// #    C::RecvStream: Send + 'static,
+/// #    C::BidiStream: Send + 'static,
 /// #    B: Buf + Send + 'static,
 /// # {
 /// // Prepare a channel to stop the driver thread
@@ -513,11 +527,19 @@ where
 
     /// Receives every frame after SETTINGS on the server's control stream as the driver reads
     /// it, from now on, with its whole payload (GOAWAY and reserved (GREASE) or unknown frames
-    /// among them), replacing any previous receiver. Frames are buffered until received.
-    pub fn subscribe_control_frames(
-        &mut self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::ext::ControlFrame> {
+    /// among them), replacing any previous receiver. The stream is read only while the
+    /// receiver takes them (see [`crate::ext::ControlFrames`]).
+    pub fn subscribe_control_frames(&mut self) -> crate::ext::ControlFrames {
         self.inner.subscribe_control_frames()
+    }
+
+    /// Receives the unidirectional streams of types HTTP/3 doesn't know (reserved (GREASE)
+    /// ones among them) the server opens from now on, rather than stopping them, replacing
+    /// any previous receiver. The connection must be driven (polled) for them to arrive.
+    pub fn subscribe_unknown_streams(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::ext::UnknownStream<C::RecvStream>> {
+        self.inner.subscribe_unknown_streams()
     }
 
     /// Receives the WebTransport streams the server opens from now on, bidirectional and
