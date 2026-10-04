@@ -271,6 +271,35 @@ where
         self.inner.stream.stop_sending(error_code)
     }
 
+    /// Tell the server to stop sending as [`Self::stop_sending`] does, then wait for how it ends
+    /// the response stream: `Some` with the code it reset the stream with, `None` if it sent all
+    /// of it (or all of it was read). A relay learns which code to end the stream it relays this
+    /// one to with.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn stop_and_await_end(
+        &mut self,
+        error_code: Code,
+    ) -> Result<Option<Code>, StreamError> {
+        future::poll_fn(|cx| self.poll_stop_and_await_end(cx, error_code)).await
+    }
+
+    /// Poll [`Self::stop_and_await_end`]: the first call stops the stream
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_stop_and_await_end(
+        &mut self,
+        cx: &mut Context<'_>,
+        error_code: Code,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        self.inner
+            .stream
+            .poll_stop_and_await_end(cx, error_code)
+            .map(|ended| {
+                ended
+                    .map(|code| code.map(Code::from))
+                    .map_err(|error| self.handle_quic_stream_error(error))
+            })
+    }
+
     /// Returns the underlying stream id
     pub fn id(&self) -> StreamId {
         self.inner.stream.id()
