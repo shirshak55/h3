@@ -344,6 +344,12 @@ where
     pub async fn control_written(&self) {
         future::poll_fn(|cx| self.conn_state.poll_control_written(cx)).await
     }
+
+    /// Whether the server's SETTINGS enabled HTTP datagrams (RFC 9297 §2.1.1): false until
+    /// they arrived.
+    pub fn peer_enables_datagram(&self) -> bool {
+        self.conn_state.settings().enable_datagram()
+    }
 }
 
 impl<T, B> Clone for SendRequest<T, B>
