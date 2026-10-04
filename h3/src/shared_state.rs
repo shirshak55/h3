@@ -18,8 +18,9 @@ use http::HeaderName;
 use crate::{
     config::Settings,
     error::{
+        connection_error_creators::convert_to_connection_error,
         internal_error::{ErrorOrigin, InternalConnectionError},
-        Code,
+        Code, StreamError,
     },
     ext::{ControlFrame, HeaderOrder, PushEvent},
     proto::headers::{Header, HeaderError},
@@ -140,6 +141,25 @@ impl SharedState {
     pub(crate) fn send_control_frame(&self, frame: &crate::ext::ControlFrame) {
         frame.encode(&mut *self.control_out());
         self.waker.wake();
+    }
+
+    /// Queues `frame` as it is, changing none of the connection's state (see
+    /// [`crate::client::SendRequest::send_control_frame`]): fails once the connection failed,
+    /// or if a value doesn't fit a variable-length integer.
+    pub(crate) fn send_raw_control_frame(&self, frame: &ControlFrame) -> Result<(), StreamError> {
+        if let Some(error) = self.get_conn_error() {
+            return Err(StreamError::ConnectionError(convert_to_connection_error(
+                error,
+            )));
+        }
+        if !frame.is_valid() {
+            return Err(StreamError::StreamError {
+                code: Code::H3_INTERNAL_ERROR,
+                reason: "a control frame value is not a valid variable-length integer".to_string(),
+            });
+        }
+        self.send_control_frame(frame);
+        Ok(())
     }
 
     /// Records whether the driver holds control-stream frames the transport has not taken

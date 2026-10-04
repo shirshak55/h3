@@ -211,15 +211,29 @@ where
         )
     }
 
-    /// Initiate a graceful shutdown, accepting `max_request` potentially still in-flight
+    /// Sends `frame` on the control stream as it is, changing none of this server's state: a
+    /// reserved (GREASE) or unknown frame, for instance relaying one another peer sent (a
+    /// GOAWAY goes through [`Connection::shutdown`], which rejects the requests it refuses).
+    /// Fails once the connection failed, or if a value doesn't fit a variable-length integer.
+    /// The connection is driven by [`Connection::accept`], which writes it.
+    pub fn send_control_frame(
+        &self,
+        frame: crate::ext::ControlFrame,
+    ) -> Result<(), crate::error::StreamError> {
+        self.inner.shared.send_raw_control_frame(&frame)
+    }
+
+    /// Initiate a graceful shutdown, accepting `max_request` potentially still in-flight past
+    /// the requests accepted: the GOAWAY sent names the first request stream after them, and
+    /// requests from it on are rejected (H3_REQUEST_REJECTED)
     ///
     /// See [connection shutdown](https://www.rfc-editor.org/rfc/rfc9114.html#connection-shutdown) for more information.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn shutdown(&mut self, max_requests: usize) -> Result<(), ConnectionError> {
-        let max_id = self
-            .last_accepted_stream
-            .map(|id| id + max_requests)
-            .unwrap_or(StreamId::FIRST_REQUEST);
+        let max_id = match self.last_accepted_stream {
+            Some(id) => id + (max_requests + 1),
+            None => StreamId::FIRST_REQUEST + max_requests,
+        };
 
         self.inner.shutdown(&mut self.sent_closing, max_id).await
     }
@@ -239,7 +253,9 @@ where
             let conn = self.inner.poll_accept_bi(cx)?;
             return match conn {
                 Poll::Pending => {
-                    let done = if conn.is_pending() {
+                    let done = if !self.inner.config.end_after_goaway {
+                        false
+                    } else if conn.is_pending() {
                         self.recv_closing.is_some() && self.poll_requests_completion(cx).is_ready()
                     } else {
                         self.poll_requests_completion(cx).is_ready()
@@ -258,10 +274,12 @@ where
                     // incoming requests not belonging to the grace interval. It's possible that
                     // some acceptable request streams arrive after rejected requests.
                     if let Some(max_id) = self.sent_closing {
-                        if s.send_id() > max_id {
+                        if s.send_id() >= max_id {
                             s.stop_sending(Code::H3_REQUEST_REJECTED.value());
                             s.reset(Code::H3_REQUEST_REJECTED.value());
-                            if self.poll_requests_completion(cx).is_ready() {
+                            if self.inner.config.end_after_goaway
+                                && self.poll_requests_completion(cx).is_ready()
+                            {
                                 break Poll::Ready(Ok(None));
                             }
                             continue;

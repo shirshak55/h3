@@ -28,6 +28,9 @@ pub struct Config {
     pub(crate) deliver_pushes: bool,
     /// Hold back SETTINGS and the rest written on the unidirectional streams until started
     pub(crate) defer_settings: bool,
+    /// A server's accept ends once a GOAWAY was received, or one sent rejected a request, and
+    /// the requests in flight completed
+    pub(crate) end_after_goaway: bool,
 
     #[cfg(test)]
     pub(crate) send_settings: bool,
@@ -113,6 +116,7 @@ impl TryFrom<Config> for frame::Settings {
             qpack_lazy_stream_types: _,
             control_frames: _,
             defer_settings: _,
+            end_after_goaway: _,
             #[cfg(test)]
                 send_settings: _,
             settings:
@@ -247,6 +251,7 @@ impl Default for Config {
             control_frames: Vec::new(),
             deliver_pushes: false,
             defer_settings: false,
+            end_after_goaway: true,
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),

@@ -63,7 +63,8 @@ impl<S, B> FrameStream<S, B> {
         self.decoder.keep_frames = true;
     }
 
-    /// The frames read since the last call: type, payload length and the first payload bytes.
+    /// The frames read since the last call: type, payload length and payload (a DATA frame's as
+    /// far as it was buffered).
     pub(crate) fn take_frames(&mut self) -> Vec<(u64, u64, Bytes)> {
         std::mem::take(&mut self.decoder.frames)
     }
@@ -295,10 +296,7 @@ impl FrameDecoder {
                 let mut frame = src.cursor();
                 let ty = frame.get_var().expect("a decoded frame has a type");
                 let len = frame.get_var().expect("a decoded frame has a length");
-                let kept = frame
-                    .remaining()
-                    .min(len as usize)
-                    .min(crate::ext::CONTROL_PAYLOAD_RECORD_LIMIT);
+                let kept = frame.remaining().min(len as usize);
                 self.frames.push((ty, len, frame.copy_to_bytes(kept)));
             }
 

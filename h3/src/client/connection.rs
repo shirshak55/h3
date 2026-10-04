@@ -317,6 +317,16 @@ where
         Ok(())
     }
 
+    /// Sends `frame` on the control stream as it is, changing none of this client's state: a
+    /// GOAWAY (with the push ID given, which must not exceed one sent before) or a reserved
+    /// (GREASE) or unknown frame, for instance relaying one another peer sent. MAX_PUSH_ID,
+    /// CANCEL_PUSH and PRIORITY_UPDATE have their own methods. Fails once the connection
+    /// failed, or if a value doesn't fit a variable-length integer. The connection driver
+    /// writes it after the SETTINGS.
+    pub fn send_control_frame(&self, frame: crate::ext::ControlFrame) -> Result<(), StreamError> {
+        self.conn_state.send_raw_control_frame(&frame)
+    }
+
     /// Resolves once the control-stream frames queued so far (a
     /// [`send_priority_update`](Self::send_priority_update)) reached the transport, so a
     /// request sent after it goes out after them.
@@ -499,6 +509,15 @@ where
         &mut self,
     ) -> tokio::sync::mpsc::UnboundedReceiver<PushDelivery<C::RecvStream, B>> {
         self.inner.subscribe_pushes()
+    }
+
+    /// Receives every frame after SETTINGS on the server's control stream as the driver reads
+    /// it, from now on, with its whole payload (GOAWAY and reserved (GREASE) or unknown frames
+    /// among them), replacing any previous receiver. Frames are buffered until received.
+    pub fn subscribe_control_frames(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::ext::ControlFrame> {
+        self.inner.subscribe_control_frames()
     }
 
     /// How the server used its QPACK encoder stream so far. `None` unless this client

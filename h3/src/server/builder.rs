@@ -104,6 +104,16 @@ impl Builder {
         self
     }
 
+    /// Whether [`Connection::accept`] ends (`Ok(None)`, sending a last GOAWAY) once the client
+    /// sent GOAWAY, or a GOAWAY sent rejected a request, and the requests in flight completed.
+    /// With `false` it ends only with the connection, which a GOAWAY then leaves open for the
+    /// application to close, as a proxy relaying its peers' GOAWAY frames does. `true` by
+    /// default.
+    pub fn end_after_goaway(&mut self, value: bool) -> &mut Self {
+        self.config.end_after_goaway = value;
+        self
+    }
+
     /// Advertise SETTINGS_QPACK_MAX_TABLE_CAPACITY: above 0, field sections are decoded with a
     /// QPACK dynamic table of up to this many bytes, built from the peer's encoder stream, and
     /// acknowledged on the decoder stream. 0 (the default) decodes without one, as before.

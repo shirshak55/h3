@@ -881,11 +881,11 @@ where
                     return Poll::Ready(Err(self.handle_connection_error(error)));
                 }
             }
-            if let Some(tx) = &self.control_frames_tx {
-                let _ = tx.send(frame.clone());
-            }
             if self.peer_control_frames.len() < PEER_RECORD_LIMIT {
-                self.peer_control_frames.push(frame);
+                self.peer_control_frames.push(frame.recorded());
+            }
+            if let Some(tx) = &self.control_frames_tx {
+                let _ = tx.send(frame);
             }
         }
 
@@ -1372,7 +1372,7 @@ where
     }
 
     /// Receives every frame after SETTINGS on the peer's control stream as it is read from now
-    /// on, replacing any previous receiver.
+    /// on, with its whole payload, replacing any previous receiver.
     pub fn subscribe_control_frames(&mut self) -> mpsc::UnboundedReceiver<ControlFrame> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.control_frames_tx = Some(tx);

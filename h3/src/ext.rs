@@ -117,8 +117,8 @@ pub enum ControlFrame {
     /// GOAWAY
     Goaway(u64),
     /// A frame of a reserved (GREASE) or other unknown type with a `len`-byte payload. A
-    /// recorded one keeps the first 256 payload bytes in `payload`; a sent one is `payload`
-    /// padded with zeros to `len` (or cut to it).
+    /// recorded one keeps the first 256 payload bytes in `payload`, a subscribed one all of
+    /// them; a sent one is `payload` padded with zeros to `len` (or cut to it).
     Other {
         /// The frame type
         ty: u64,
@@ -154,6 +154,16 @@ impl ControlFrame {
             (0x7, Some(id)) if !buf.has_remaining() => Self::Goaway(id),
             _ => Self::Other { ty, len, payload },
         }
+    }
+
+    /// The frame as recorded: an unknown one keeps its first [`CONTROL_PAYLOAD_RECORD_LIMIT`]
+    /// payload bytes
+    pub(crate) fn recorded(&self) -> Self {
+        let mut frame = self.clone();
+        if let Self::Other { payload, .. } = &mut frame {
+            payload.truncate(CONTROL_PAYLOAD_RECORD_LIMIT);
+        }
+        frame
     }
 
     /// Whether every value fits a variable-length integer
