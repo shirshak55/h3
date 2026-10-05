@@ -305,7 +305,8 @@ impl Iterator for HeaderIter {
 impl TryFrom<Vec<HeaderField>> for Header {
     type Error = HeaderError;
     fn try_from(headers: Vec<HeaderField>) -> Result<Self, Self::Error> {
-        let mut fields = HeaderMap::with_capacity(headers.len());
+        let mut fields = HeaderMap::try_with_capacity(headers.len())
+            .map_err(|_| HeaderError::TooManyFields(headers.len()))?;
         let mut pseudo = Pseudo::default();
         let mut pseudo_order = Vec::new();
 
@@ -551,6 +552,8 @@ pub enum HeaderError {
     MissingAuthority,
     ContradictedAuthority,
     ProtocolWithoutConnect,
+    /// More field lines than a [`HeaderMap`] holds
+    TooManyFields(usize),
 }
 
 impl HeaderError {
@@ -593,6 +596,9 @@ impl fmt::Display for HeaderError {
                     f,
                     ":protocol pseudo-header on a request whose method is not CONNECT"
                 )
+            }
+            HeaderError::TooManyFields(count) => {
+                write!(f, "{count} field lines, more than a header map holds")
             }
         }
     }

@@ -120,9 +120,14 @@ impl Decoder {
         self.table.total_inserted()
     }
 
-    // Decode field lines received on Request of Push stream.
+    // Decode field lines received on Request of Push stream, stopping once they exceed
+    // `max_size`: the section is refused, though acknowledged as a whole one is.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
-    pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
+    pub fn decode_header<T: Buf>(
+        &self,
+        buf: &mut T,
+        max_size: u64,
+    ) -> Result<Decoded, DecoderError> {
         let (required_ref, base) =
             HeaderPrefix::decode(buf)?.get(self.table.total_inserted(), self.max_capacity)?;
 
@@ -137,6 +142,9 @@ impl Decoder {
         while buf.has_remaining() {
             let field = Self::parse_header_field(&decoder_table, base, required_ref, buf)?;
             mem_size += field.mem_size() as u64;
+            if mem_size > max_size {
+                break;
+            }
             fields.push(field);
         }
 
@@ -682,7 +690,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         assert_eq!(
-            decoder.decode_header(&mut read),
+            decoder.decode_header(&mut read, u64::MAX),
             Err(DecoderError::MissingRefs(8))
         );
     }
@@ -713,7 +721,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(2));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(
             fields,
@@ -745,7 +753,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(fields, &[field(2), field(3), field(4)])
     }
@@ -765,7 +773,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(
             fields,
@@ -786,7 +794,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(3).with_value("new bar3")]);
     }
 
@@ -798,7 +806,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(0));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(
             fields,
             &[HeaderField::new(b"foo".to_vec(), b"bar".to_vec())]
@@ -828,7 +836,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(1), field(2), field(3), field(4)]);
     }
 
@@ -851,7 +859,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(max_entries + 10));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).expect("decode");
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).expect("decode");
         assert_eq!(fields, &[field(max_entries - 5)]);
 
         let mut buf = vec![];
@@ -869,7 +877,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(table);
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(max_entries + 6), field(max_entries + 10)]);
     }
 }

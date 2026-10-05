@@ -53,7 +53,7 @@ fn codec_basic_get() {
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
 
     let mut block_cur = Cursor::new(&mut block_buf);
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur, u64::MAX).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);
@@ -86,7 +86,7 @@ fn blocked_header() {
 
     let mut block_cur = Cursor::new(&mut block_buf);
     assert_eq!(
-        decoder.decode_header(&mut block_cur),
+        decoder.decode_header(&mut block_cur, u64::MAX),
         Err(DecoderError::MissingRefs(1))
     );
 }
@@ -120,7 +120,7 @@ fn codec_table_size_0() {
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
 
     let mut block_cur = Cursor::new(&mut block_buf);
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur, u64::MAX).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);
@@ -155,7 +155,7 @@ fn codec_table_full() {
     let mut block_cur = Cursor::new(&mut block_buf);
 
     decoder.on_encoder_recv(&mut enc_cur, &mut dec_buf).unwrap();
-    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur).unwrap();
+    let Decoded { fields, .. } = decoder.decode_header(&mut block_cur, u64::MAX).unwrap();
     assert_eq!(fields, header);
 
     let mut dec_cur = Cursor::new(&mut dec_buf);

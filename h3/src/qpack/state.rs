@@ -91,7 +91,7 @@ impl QpackState {
             return Poll::Ready(decode_stateless(&mut block.clone(), max_size));
         };
 
-        let decoded = match decoding.decoder.decode_header(&mut block.clone()) {
+        let decoded = match decoding.decoder.decode_header(&mut block.clone(), max_size) {
             Err(DecoderError::MissingRefs(required)) => {
                 if let Some((_, waker)) = decoding.blocked.get_mut(&stream_id) {
                     waker.clone_from(cx.waker());
