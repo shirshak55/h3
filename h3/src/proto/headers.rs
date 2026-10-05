@@ -589,7 +589,10 @@ impl fmt::Display for HeaderError {
                 write!(f, "uri and authority field are in contradiction")
             }
             HeaderError::ProtocolWithoutConnect => {
-                write!(f, ":protocol pseudo-header on a request whose method is not CONNECT")
+                write!(
+                    f,
+                    ":protocol pseudo-header on a request whose method is not CONNECT"
+                )
             }
         }
     }
