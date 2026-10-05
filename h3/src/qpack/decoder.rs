@@ -47,7 +47,8 @@ pub enum DecoderError {
 
 /// The least size the entry of an insert instruction (its first byte `first`) cut short in
 /// `read` can have: its strings' lengths come before them, and a Huffman-coded string decodes
-/// to at least a byte per 30 bits, the longest code.
+/// to at least a byte per 30 bits, the longest code. Another instruction, or an insert whose
+/// name index is cut short, gives 0: it waits for the rest.
 fn least_entry_size(first: u8, read: &[u8]) -> u64 {
     // A string's least decoded length and its length, once its prefix is read
     fn string(size: u8, buf: &mut Cursor<&[u8]>) -> Option<(u64, u64)> {
@@ -73,7 +74,7 @@ fn least_entry_size(first: u8, read: &[u8]) -> u64 {
         EncoderInstruction::InsertWithNameRef if prefix_int::decode(6, &mut buf).is_ok() => {
             least += string(8, &mut buf).map_or(0, |(value, _)| value);
         }
-        _ => {}
+        _ => return 0,
     }
     least
 }
