@@ -150,15 +150,21 @@ where
             return Poll::Ready(Ok(std::mem::take(&mut self.empty_data).then(Bytes::new)));
         };
 
-        let end = match self.try_recv(cx) {
-            Poll::Ready(Ok(end)) => end,
-            // Data already buffered goes first: the stream's error, such as its reset, follows it
-            Poll::Ready(Err(e)) if self.stream.buf().has_remaining() => {
-                self.error = Some(e);
-                false
+        // More is read only while the frame's rest isn't buffered: past it, the buffer would
+        // outgrow a reader taking it in pieces (at each DATA frame's end), ahead of its reading.
+        let end = if self.stream.buf().remaining() >= self.remaining_data {
+            self.stream.is_eos()
+        } else {
+            match self.try_recv(cx) {
+                Poll::Ready(Ok(end)) => end,
+                // Data already buffered goes first: the stream's error, such as its reset, follows it
+                Poll::Ready(Err(e)) if self.stream.buf().has_remaining() => {
+                    self.error = Some(e);
+                    false
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => false,
             }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => false,
         };
         let data = self.stream.buf_mut().take_chunk(self.remaining_data);
 
