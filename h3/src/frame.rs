@@ -70,6 +70,7 @@ impl<S, B> FrameStream<S, B> {
 
     /// The frames kept since the last call: type, payload length and payload.
     pub(crate) fn take_frames(&mut self) -> Vec<(u64, u64, Bytes)> {
+        self.decoder.kept = 0;
         std::mem::take(&mut self.decoder.frames)
     }
 }
@@ -105,6 +106,11 @@ where
                     Poll::Ready(Ok(frame))
                 }
                 Some(frame) => Poll::Ready(Ok(Some(frame))),
+                // The frames kept are taken before more is decoded, the caller woken for them.
+                None if self.decoder.batch_full() => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
                 None => match end {
                     // Received a chunk but frame is incomplete, poll until we get `Pending`.
                     Poll::Ready(false) => {
@@ -271,9 +277,17 @@ pub struct FrameDecoder {
     frame_types: Vec<u64>,
     keep_frames: bool,
     frames: Vec<(u64, u64, Bytes)>,
+    /// What the frames kept hold, as a subscriber's budget counts them
+    kept: usize,
 }
 
 impl FrameDecoder {
+    /// Whether the frames kept hold as much as a subscriber may hold
+    /// ([`crate::ext::ControlFrames::BUDGET`]): decoding waits for them to be taken.
+    fn batch_full(&self) -> bool {
+        self.kept >= crate::ext::ControlFrames::BUDGET
+    }
+
     fn decode<B: Buf>(
         &mut self,
         src: &mut BufList<B>,
@@ -332,6 +346,7 @@ impl FrameDecoder {
                 let len = frame.get_var().expect("a decoded frame has a length");
                 self.frames
                     .push((ty, len, frame.copy_to_bytes(len as usize)));
+                self.kept += len as usize + crate::ext::HeldFrames::OVERHEAD;
             }
 
             match decoded {
@@ -344,6 +359,9 @@ impl FrameDecoder {
 
                     src.advance(pos);
                     self.expected = None;
+                    if self.batch_full() {
+                        return Ok(None);
+                    }
                     continue;
                 }
                 Err(frame::FrameError::Incomplete(min)) => {

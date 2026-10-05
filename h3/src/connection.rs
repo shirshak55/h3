@@ -1327,23 +1327,30 @@ where
         }
     }
 
-    /// Writes the control-stream frames streams queued.
+    /// Writes the control-stream frames streams queued. Those queued while the transport
+    /// holds earlier ones back are left queued, where they count against the backlog a sender
+    /// may queue past (see [`SharedState::send_raw_control_frame`]).
     fn poll_control_send(&mut self, cx: &mut Context<'_>) -> Result<(), ConnectionError> {
         // Queued frames wait for the SETTINGS held back to go ahead of them.
         if self.deferred {
             return Ok(());
         }
-        let out = self.shared.control_out().split();
-        self.control_queue.data.extend_from_slice(&out);
-        match self.control_queue.poll_write(&mut self.control_send, cx) {
-            Poll::Ready(Err(e)) => Err(self.critical_stream_error(e, "control")),
-            Poll::Ready(Ok(())) => {
-                self.shared.set_control_in_flight(false);
-                Ok(())
+        loop {
+            if self.control_queue.data.is_empty() {
+                let out = self.shared.control_out().split();
+                self.control_queue.data.extend_from_slice(&out);
             }
-            Poll::Pending => {
-                self.shared.set_control_in_flight(true);
-                Ok(())
+            match self.control_queue.poll_write(&mut self.control_send, cx) {
+                Poll::Ready(Err(e)) => return Err(self.critical_stream_error(e, "control")),
+                Poll::Ready(Ok(())) if self.shared.control_out().is_empty() => {
+                    self.shared.set_control_in_flight(false);
+                    return Ok(());
+                }
+                Poll::Ready(Ok(())) => {}
+                Poll::Pending => {
+                    self.shared.set_control_in_flight(true);
+                    return Ok(());
+                }
             }
         }
     }

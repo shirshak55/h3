@@ -243,8 +243,10 @@ where
     /// Sends `frame` on the control stream as it is, changing none of this server's state: a
     /// reserved (GREASE) or unknown frame, for instance relaying one another peer sent (a
     /// GOAWAY goes through [`Connection::shutdown`], which rejects the requests it refuses).
-    /// Fails once the connection failed, or if a value doesn't fit a variable-length integer.
-    /// The connection is driven by [`Connection::accept`], which writes it.
+    /// Fails once the connection failed, if a value doesn't fit a variable-length integer, or
+    /// while the frames queued before and not written yet, as the client's flow control holds
+    /// the control stream back, hold 64 KiB or more (H3_EXCESSIVE_LOAD). The connection is
+    /// driven by [`Connection::accept`], which writes it.
     pub fn send_control_frame(
         &self,
         frame: crate::ext::ControlFrame,

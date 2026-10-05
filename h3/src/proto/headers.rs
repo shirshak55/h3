@@ -121,8 +121,15 @@ impl Header {
             (Some(_), Some(h)) => uri = uri.authority(h.as_bytes()),
         }
 
+        let method = self.pseudo.method.ok_or(HeaderError::MissingMethod)?;
+        // `:protocol` belongs to an extended CONNECT (RFC 8441 §4, RFC 9220 §3): on any other
+        // request it is malformed (RFC 9114 §4.3.1).
+        if self.pseudo.protocol.is_some() && method != Method::CONNECT {
+            return Err(HeaderError::ProtocolWithoutConnect);
+        }
+
         Ok((
-            self.pseudo.method.ok_or(HeaderError::MissingMethod)?,
+            method,
             // When empty host field is built into an uri it fails
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
             //# If these fields are present, they MUST NOT be
@@ -543,6 +550,7 @@ pub enum HeaderError {
     MissingStatus,
     MissingAuthority,
     ContradictedAuthority,
+    ProtocolWithoutConnect,
 }
 
 impl HeaderError {
@@ -579,6 +587,9 @@ impl fmt::Display for HeaderError {
             HeaderError::MissingAuthority => write!(f, "missing authority"),
             HeaderError::ContradictedAuthority => {
                 write!(f, "uri and authority field are in contradiction")
+            }
+            HeaderError::ProtocolWithoutConnect => {
+                write!(f, ":protocol pseudo-header on a request whose method is not CONNECT")
             }
         }
     }

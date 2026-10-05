@@ -114,6 +114,13 @@ where
         Ok(ResolvedStream::Request(request, stream))
     }
 
+    /// Rejects the stream unread (H3_REQUEST_REJECTED, RFC 9114 §4.1.1): no part of its
+    /// request is processed, so the client may retry it.
+    pub fn reject(mut self) {
+        self.frame_stream.stop_sending(Code::H3_REQUEST_REJECTED);
+        self.frame_stream.reset(Code::H3_REQUEST_REJECTED.value());
+    }
+
     /// Accepts a http request where the first frame has already been read and decoded.
     ///
     /// This is needed as a bidirectional stream may be read as part of incoming webtransport

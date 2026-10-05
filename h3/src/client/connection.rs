@@ -260,7 +260,9 @@ where
     /// Send a PRIORITY_UPDATE (RFC 9218) for the request stream `stream_id` on the control
     /// stream, with the Priority Field Value `priority` (e.g. `u=0, i`), for instance mirroring
     /// one a client sent for the request forwarded on `stream_id`. The connection driver writes
-    /// it. The stream may be one this client has not opened yet.
+    /// it. The stream may be one this client has not opened yet. Fails once the connection
+    /// failed, or while the control stream holds back as many frames as it may queue (see
+    /// [`Self::send_control_frame`]).
     pub fn send_priority_update(
         &self,
         stream_id: StreamId,
@@ -281,12 +283,11 @@ where
             });
         }
         self.conn_state
-            .send_control_frame(&crate::ext::ControlFrame::PriorityUpdate {
+            .send_raw_control_frame(&crate::ext::ControlFrame::PriorityUpdate {
                 push: false,
                 id: stream_id.into_inner(),
                 priority: priority.into(),
-            });
-        Ok(())
+            })
     }
 
     /// Sends MAX_PUSH_ID `max_push_id` on the control stream, raising the one sent so far
@@ -325,8 +326,10 @@ where
     /// GOAWAY (with the push ID given, which must not exceed one sent before) or a reserved
     /// (GREASE) or unknown frame, for instance relaying one another peer sent. MAX_PUSH_ID,
     /// CANCEL_PUSH and PRIORITY_UPDATE have their own methods. Fails once the connection
-    /// failed, or if a value doesn't fit a variable-length integer. The connection driver
-    /// writes it after the SETTINGS.
+    /// failed, if a value doesn't fit a variable-length integer, or while the frames queued
+    /// before and not written yet, as the server's flow control holds the control stream back,
+    /// hold 64 KiB or more (H3_EXCESSIVE_LOAD). The connection driver writes it after the
+    /// SETTINGS.
     pub fn send_control_frame(&self, frame: crate::ext::ControlFrame) -> Result<(), StreamError> {
         self.conn_state.send_raw_control_frame(&frame)
     }

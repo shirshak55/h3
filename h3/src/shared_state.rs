@@ -31,6 +31,10 @@ use crate::{
 /// `SharedState::max_push_id` before the client sent MAX_PUSH_ID (no push ID is that large)
 const NO_MAX_PUSH_ID: u64 = u64::MAX;
 
+/// How many bytes of control-stream frames waiting for the driver to write them (those it
+/// holds aside) a frame sent through [`SharedState::send_raw_control_frame`] may queue past
+const CONTROL_BACKLOG: usize = 64 * 1024;
+
 #[derive(Debug)]
 /// This struct represents the shared state of the h3 connection and the stream structs
 pub struct SharedState {
@@ -145,7 +149,9 @@ impl SharedState {
 
     /// Queues `frame` as it is, changing none of the connection's state (see
     /// [`crate::client::SendRequest::send_control_frame`]): fails once the connection failed,
-    /// or if a value doesn't fit a variable-length integer.
+    /// if a value doesn't fit a variable-length integer, or while the frames queued before
+    /// hold [`CONTROL_BACKLOG`] bytes the driver didn't take yet, as the peer's flow control
+    /// holds the control stream back.
     pub(crate) fn send_raw_control_frame(&self, frame: &ControlFrame) -> Result<(), StreamError> {
         if let Some(error) = self.get_conn_error() {
             return Err(StreamError::ConnectionError(convert_to_connection_error(
@@ -158,7 +164,19 @@ impl SharedState {
                 reason: "a control frame value is not a valid variable-length integer".to_string(),
             });
         }
-        self.send_control_frame(frame);
+        let mut out = self.control_out();
+        if out.len() >= CONTROL_BACKLOG {
+            return Err(StreamError::StreamError {
+                code: Code::H3_EXCESSIVE_LOAD,
+                reason: format!(
+                    "the control stream holds {} bytes of frames not written yet",
+                    out.len()
+                ),
+            });
+        }
+        frame.encode(&mut *out);
+        drop(out);
+        self.waker.wake();
         Ok(())
     }
 

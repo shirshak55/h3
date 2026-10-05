@@ -291,7 +291,7 @@ pub(crate) struct HeldFrames {
 
 impl HeldFrames {
     /// What a frame held counts for beyond its payload.
-    const OVERHEAD: usize = 64;
+    pub(crate) const OVERHEAD: usize = 64;
 
     fn cost(frame: &ControlFrame) -> usize {
         frame.size() + Self::OVERHEAD
