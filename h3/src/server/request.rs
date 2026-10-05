@@ -346,6 +346,9 @@ where
 
         //  request_stream.stop_stream(Code::H3_MESSAGE_ERROR).await;
 
+        if method != http::Method::CONNECT {
+            self.request_stream.inner.content_left = crate::connection::content_length(&headers);
+        }
         let mut req = http::Request::new(());
         *req.method_mut() = method;
         *req.uri_mut() = uri;

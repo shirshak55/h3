@@ -189,6 +189,14 @@ where
                     reason: "Received malformed header".to_string(),
                 }
             })?;
+        // A response defined as having no content can announce a length it doesn't carry.
+        let content = !self.inner.no_response_content
+            && !status.is_informational()
+            && status != http::StatusCode::NO_CONTENT
+            && status != http::StatusCode::NOT_MODIFIED;
+        self.inner.content_left = content
+            .then(|| connection::content_length(&headers))
+            .flatten();
         let mut resp = Response::new(());
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;

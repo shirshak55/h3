@@ -166,6 +166,7 @@ where
         } = parts;
         let order = extensions.get::<crate::ext::HeaderOrder>().cloned();
         let pseudo_order = extensions.get::<crate::ext::PseudoOrder>().cloned();
+        let no_response_content = matches!(method, http::Method::HEAD | http::Method::CONNECT);
         let mut headers = Header::request(method, uri, headers, extensions).map_err(|_e| {
             self.handle_connection_error_on_stream(InternalConnectionError {
                 code: Code::H3_INTERNAL_ERROR,
@@ -246,6 +247,7 @@ where
         };
         request_stream.inner.qpack_end = qpack_end;
         request_stream.inner.push_end = push_end;
+        request_stream.inner.no_response_content = no_response_content;
         // send the grease frame only once
         self.send_grease_frame = false;
         Ok(request_stream)

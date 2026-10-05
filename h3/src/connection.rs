@@ -1576,6 +1576,23 @@ pub struct RequestStream<S, B> {
     /// The promises decoded ahead of the frame a caller asked for (those before the
     /// response HEADERS, for one), in wire order, until a caller takes them
     promises: VecDeque<PromisedPush>,
+    /// What the message's Content-Length announced, less what its DATA frames carried so
+    /// far: they carry no more, and at its end, no less (RFC 9114 §4.1.2)
+    pub(crate) content_left: Option<u64>,
+    /// Whether the request is a HEAD or CONNECT, whose response's Content-Length frames no
+    /// content
+    pub(crate) no_response_content: bool,
+}
+
+/// The content length `headers` announce, when one value does.
+pub(crate) fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// The next frame of a request stream, or a PUSH_PROMISE delivered in its place
@@ -1603,6 +1620,8 @@ impl<S, B> RequestStream<S, B> {
             push_end: None,
             promise: None,
             promises: VecDeque::new(),
+            content_left: None,
+            no_response_content: false,
         }
     }
 
@@ -1756,9 +1775,15 @@ where
                 }
                 Ok(NextFrame::Frame(None)) => {
                     self.ended();
+                    if let Some(error) = self.content_short() {
+                        return Poll::Ready(Err(error));
+                    }
                     return Poll::Ready(Ok(None));
                 }
                 Ok(NextFrame::Frame(Some(Frame::Headers(encoded)))) => {
+                    if let Some(error) = self.content_short() {
+                        return Poll::Ready(Err(error));
+                    }
                     self.trailers = Some(encoded);
                     // Received trailers, no more data expected
                     return Poll::Ready(Ok(None));
@@ -1798,10 +1823,42 @@ where
             };
         }
 
-        self.stream
-            .poll_data(cx)
-            .map_ok(|data| data.map(RecvEvent::Data))
-            .map_err(|error| self.handle_frame_stream_error_on_request_stream(error))
+        let data = match ready!(self.stream.poll_data(cx)) {
+            Ok(data) => data,
+            Err(error) => {
+                return Poll::Ready(Err(self.handle_frame_stream_error_on_request_stream(error)))
+            }
+        };
+        if let (Some(data), Some(left)) = (&data, self.content_left) {
+            match left.checked_sub(data.remaining() as u64) {
+                Some(left) => self.content_left = Some(left),
+                None => {
+                    return Poll::Ready(Err(self.malformed_content(format!(
+                        "DATA frames carry more than the {left} bytes of content left"
+                    ))))
+                }
+            }
+        }
+        Poll::Ready(Ok(data.map(RecvEvent::Data)))
+    }
+
+    /// The error of a message ending short of the content its Content-Length announced.
+    fn content_short(&mut self) -> Option<StreamError> {
+        let left = self.content_left.filter(|left| *left > 0)?;
+        Some(self.malformed_content(format!(
+            "the message ended {left} bytes short of its Content-Length"
+        )))
+    }
+
+    /// A message whose DATA frames don't carry the content its Content-Length announced is
+    /// malformed: a stream error of type H3_MESSAGE_ERROR (RFC 9114 §4.1.2).
+    fn malformed_content(&mut self, reason: String) -> StreamError {
+        self.content_left = None;
+        self.stream.stop_sending(Code::H3_MESSAGE_ERROR);
+        StreamError::StreamError {
+            code: Code::H3_MESSAGE_ERROR,
+            reason,
+        }
     }
 
     /// Poll receive trailers.
@@ -2096,6 +2153,8 @@ where
                 push_end: None,
                 promise: None,
                 promises: VecDeque::new(),
+                content_left: None,
+                no_response_content: false,
             },
             RequestStream {
                 stream: recv,
@@ -2107,6 +2166,8 @@ where
                 push_end: self.push_end,
                 promise: self.promise,
                 promises: self.promises,
+                content_left: self.content_left,
+                no_response_content: self.no_response_content,
             },
         )
     }
