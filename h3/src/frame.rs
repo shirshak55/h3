@@ -30,6 +30,8 @@ pub struct FrameStream<S, B> {
     // Already read data from the stream
     decoder: FrameDecoder,
     remaining_data: usize,
+    /// Whether the payload read is a WebTransport stream's, which runs to the stream's end
+    unbounded: bool,
     /// Whether the last frame read was a zero-length DATA frame, yielded as an empty chunk
     empty_data: bool,
     /// The stream's error, read while data was still buffered
@@ -42,6 +44,7 @@ impl<S, B> FrameStream<S, B> {
             stream,
             decoder: FrameDecoder::default(),
             remaining_data: 0,
+            unbounded: false,
             empty_data: false,
             error: None,
         }
@@ -92,10 +95,11 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Frame<PayloadLen>>, FrameStreamError>> {
-        assert!(
-            self.remaining_data == 0,
-            "There is still data to read, please call poll_data() until it returns None."
-        );
+        if self.has_data() {
+            return Poll::Ready(Err(FrameStreamError::Quic(StreamErrorIncoming::Unknown(
+                "a frame was read before the previous one's data".into(),
+            ))));
+        }
 
         self.empty_data = false;
         // A frame already buffered goes first: the stream's next read may be its reset
@@ -108,7 +112,7 @@ where
                     Poll::Ready(Ok(Some(Frame::Data(PayloadLen(len)))))
                 }
                 frame @ Some(Frame::WebTransportStream(_)) => {
-                    self.remaining_data = usize::MAX;
+                    self.unbounded = true;
                     Poll::Ready(Ok(frame))
                 }
                 Some(frame) => Poll::Ready(Ok(Some(frame))),
@@ -146,13 +150,17 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<impl Buf>, FrameStreamError>> {
-        if self.remaining_data == 0 {
+        if !self.has_data() {
             return Poll::Ready(Ok(std::mem::take(&mut self.empty_data).then(Bytes::new)));
+        };
+        let wanted = match self.unbounded {
+            true => usize::MAX,
+            false => self.remaining_data,
         };
 
         // More is read only while the frame's rest isn't buffered: past it, the buffer would
         // outgrow a reader taking it in pieces (at each DATA frame's end), ahead of its reading.
-        let end = if self.stream.buf().remaining() >= self.remaining_data {
+        let end = if self.stream.buf().remaining() >= wanted {
             self.stream.is_eos()
         } else {
             match self.try_recv(cx) {
@@ -166,19 +174,24 @@ where
                 Poll::Pending => false,
             }
         };
-        let data = self.stream.buf_mut().take_chunk(self.remaining_data);
+        let data = self.stream.buf_mut().take_chunk(wanted);
 
         match (data, end) {
-            (None, true) => Poll::Ready(Ok(None)),
             (None, false) => Poll::Pending,
+            (None, true) if self.unbounded => Poll::Ready(Ok(None)),
+            // A frame the stream's end cuts short is malformed
+            (None, true) => Poll::Ready(Err(FrameStreamError::UnexpectedEnd)),
             (Some(d), true)
-                if d.remaining() < self.remaining_data
+                if !self.unbounded
+                    && d.remaining() < self.remaining_data
                     && !self.stream.buf_mut().has_remaining() =>
             {
                 Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
             }
             (Some(d), _) => {
-                self.remaining_data -= d.remaining();
+                if !self.unbounded {
+                    self.remaining_data -= d.remaining();
+                }
                 Poll::Ready(Ok(Some(d)))
             }
         }
@@ -200,7 +213,7 @@ where
     }
 
     pub(crate) fn has_data(&self) -> bool {
-        self.remaining_data != 0
+        self.unbounded || self.remaining_data != 0
     }
 
     pub(crate) fn is_eos(&self) -> bool {
@@ -268,6 +281,7 @@ where
                 stream: send,
                 decoder: FrameDecoder::default(),
                 remaining_data: 0,
+                unbounded: false,
                 empty_data: false,
                 error: None,
             },
@@ -275,6 +289,7 @@ where
                 stream: recv,
                 decoder: self.decoder,
                 remaining_data: self.remaining_data,
+                unbounded: self.unbounded,
                 empty_data: self.empty_data,
                 error: self.error,
             },
@@ -600,9 +615,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(
-        expected = "There is still data to read, please call poll_data() until it returns None"
-    )]
     async fn poll_next_reamining_data() {
         let mut recv = FakeRecv::default();
         let mut buf = BytesMut::with_capacity(64);
@@ -617,8 +629,11 @@ mod tests {
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
 
-        // There is still data to consume, poll_next should panic
-        let _ = poll_fn(|cx| stream.poll_next(cx)).await;
+        // There is still data to consume, poll_next fails
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::Quic(StreamErrorIncoming::Unknown(_)))
+        );
     }
 
     #[tokio::test]
