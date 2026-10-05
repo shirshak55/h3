@@ -1359,7 +1359,8 @@ async fn request_invalid_trailing_byte() {
 
 #[tokio::test]
 async fn request_invalid_data_frame_length_too_large() {
-    request_sequence_frame_error(|mut buf| {
+    // The DATA frame takes the trailers' type: their length, 0xd, reads as a MAX_PUSH_ID frame's.
+    request_sequence_unexpected(|mut buf| {
         request_encode(
             &mut buf,
             Request::post("http://localhost/salut").body(()).unwrap(),

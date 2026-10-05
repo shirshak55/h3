@@ -101,6 +101,21 @@ impl Frame<PayloadLen> {
             return Ok(Frame::Data((len as usize).into()));
         }
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+        //# These frame
+        //# types MUST NOT be sent, and their receipt MUST be treated as a
+        //# connection error of type H3_FRAME_UNEXPECTED.
+        // Refused at the header, not once its payload is buffered.
+        let h2 = [
+            FrameType::H2_PRIORITY,
+            FrameType::H2_PING,
+            FrameType::H2_WINDOW_UPDATE,
+            FrameType::H2_CONTINUATION,
+        ];
+        if h2.contains(&ty) {
+            return Err(FrameError::UnsupportedFrame(ty.0));
+        }
+
         if buf.remaining() < len as usize {
             return Err(FrameError::Incomplete(2 + len as usize));
         }
@@ -110,29 +125,46 @@ impl Frame<PayloadLen> {
         #[cfg(feature = "tracing")]
         trace!("frame ty: {:?}", ty);
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+        //# A frame payload that contains additional bytes
+        //# after the identified fields or a frame payload that terminates before
+        //# the end of the identified fields MUST be treated as a connection
+        //# error of type H3_FRAME_ERROR.
+        // The payload is buffered whole: a field it cuts short isn't still arriving, and bytes
+        // past the fields aren't the next frame.
+        let cut_short = |_: UnexpectedEnd| FrameError::Malformed;
         let frame = match ty {
             FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len as usize))),
             FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
-            FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
-            FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
-            FrameType::GOAWAY => Ok(Frame::Goaway(VarInt::decode(&mut payload)?)),
-            FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
-            //# These frame
-            //# types MUST NOT be sent, and their receipt MUST be treated as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
-            FrameType::H2_PRIORITY
+            FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(
+                payload.get_var().map_err(cut_short)?.try_into()?,
+            )),
+            FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(
+                PushPromise::decode(&mut payload).map_err(cut_short)?,
+            )),
+            FrameType::GOAWAY => Ok(Frame::Goaway(
+                VarInt::decode(&mut payload).map_err(cut_short)?,
+            )),
+            FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(
+                payload.get_var().map_err(cut_short)?.try_into()?,
+            )),
+            FrameType::WEBTRANSPORT_BI_STREAM
+            | FrameType::DATA
+            | FrameType::H2_PRIORITY
             | FrameType::H2_PING
             | FrameType::H2_WINDOW_UPDATE
-            | FrameType::H2_CONTINUATION => Err(FrameError::UnsupportedFrame(ty.0)),
-            FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => unreachable!(),
+            | FrameType::H2_CONTINUATION => unreachable!(),
             _ => {
-                buf.advance(len as usize);
+                payload.advance(len as usize);
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
                 //# Endpoints MUST
                 //# NOT consider these frames to have any meaning upon receipt.
                 Err(FrameError::UnknownFrame(ty.0))
             }
+        };
+        let frame = match frame {
+            Ok(_) if payload.has_remaining() => Err(FrameError::Malformed),
+            frame => frame,
         };
 
         if let Ok(_frame) = &frame {
@@ -292,6 +324,8 @@ macro_rules! frame_types {
     {$($name:ident = $val:expr,)*} => {
         impl FrameType {
             $(pub const $name: FrameType = FrameType($val);)*
+            /// Every type above: frames of any other mean nothing (RFC 9114 §9)
+            const KNOWN: &[FrameType] = &[$(FrameType::$name,)*];
         }
     }
 }
@@ -333,6 +367,23 @@ impl FrameType {
 
     pub(crate) fn value(self) -> u64 {
         self.0
+    }
+
+    /// Whether frames of type `ty` mean nothing, to be skipped (RFC 9114 §7.2.8, §9)
+    pub(crate) fn is_unknown(ty: u64) -> bool {
+        !Self::KNOWN.contains(&FrameType(ty))
+    }
+
+    /// Whether frames of type `ty` go only on a control stream (RFC 9114 §7.2.3, §7.2.4,
+    /// §7.2.6, §7.2.7)
+    pub(crate) fn is_control(ty: u64) -> bool {
+        [
+            Self::CANCEL_PUSH,
+            Self::SETTINGS,
+            Self::GOAWAY,
+            Self::MAX_PUSH_ID,
+        ]
+        .contains(&FrameType(ty))
     }
 
     #[cfg(test)]

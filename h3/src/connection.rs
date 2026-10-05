@@ -1593,6 +1593,7 @@ impl<S, B> RequestStream<S, B> {
         grease: bool,
     ) -> Self {
         stream.limit_field_sections(max_field_section_size);
+        stream.refuse_control_frames();
         Self {
             stream,
             conn_state,

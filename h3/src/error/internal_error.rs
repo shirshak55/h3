@@ -65,6 +65,14 @@ impl InternalConnectionError {
                     crate::frame::MAX_KEPT_FRAME
                 ),
             },
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+            //# If an endpoint receives a SETTINGS frame on a different
+            //# stream, the endpoint MUST respond with a connection error of type
+            //# H3_FRAME_UNEXPECTED.
+            FrameProtocolError::ControlFrame(ty) => InternalConnectionError {
+                code: Code::H3_FRAME_UNEXPECTED,
+                message: format!("control frame 0x{ty:x} on a request or push stream"),
+            },
             FrameProtocolError::FieldSectionTooLarge { size, max } => InternalConnectionError {
                 code: Code::H3_EXCESSIVE_LOAD,
                 message: format!("field section of {size} bytes longer than {max} bytes"),

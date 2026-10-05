@@ -162,6 +162,7 @@ where
         mut stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
         stream.limit_field_sections(self.max_field_section_size);
+        stream.refuse_control_frames();
         let qpack_end = QpackStreamEnd::track(&self.inner.shared, stream.send_id());
         RequestResolver {
             request_end: RequestEnd {

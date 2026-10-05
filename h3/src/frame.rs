@@ -77,6 +77,12 @@ impl<S, B> FrameStream<S, B> {
         self.decoder.max_field_section = Some(max);
     }
 
+    /// Refuses a frame only a control stream carries as soon as its type is read
+    /// ([`FrameProtocolError::ControlFrame`]): a request or push stream carries none.
+    pub(crate) fn refuse_control_frames(&mut self) {
+        self.decoder.refuse_control = true;
+    }
+
     /// The frames kept since the last call: type, payload length and payload.
     pub(crate) fn take_frames(&mut self) -> Vec<(u64, u64, Bytes)> {
         self.decoder.kept = 0;
@@ -129,7 +135,7 @@ where
                     }
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(true) => {
-                        if self.stream.buf_mut().has_remaining() {
+                        if self.stream.buf_mut().has_remaining() || self.decoder.skipping != 0 {
                             // Reached the end of receive stream, but there is still some data:
                             // The frame is incomplete.
                             Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
@@ -217,7 +223,7 @@ where
     }
 
     pub(crate) fn is_eos(&self) -> bool {
-        self.stream.is_eos() && !self.stream.buf().has_remaining()
+        self.stream.is_eos() && !self.stream.buf().has_remaining() && self.decoder.skipping == 0
     }
 
     fn try_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool, FrameStreamError>> {
@@ -308,6 +314,10 @@ pub struct FrameDecoder {
     kept: usize,
     /// The longest HEADERS or PUSH_PROMISE payload read (see [`FrameStream::limit_field_sections`])
     max_field_section: Option<u64>,
+    /// See [`FrameStream::refuse_control_frames`]
+    refuse_control: bool,
+    /// What is left of the unknown frame being skipped
+    skipping: u64,
 }
 
 impl FrameDecoder {
@@ -324,6 +334,17 @@ impl FrameDecoder {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
         loop {
+            if self.skipping != 0 {
+                let skipped = src
+                    .remaining()
+                    .min(usize::try_from(self.skipping).unwrap_or(usize::MAX));
+                src.advance(skipped);
+                self.skipping -= skipped as u64;
+                if self.skipping != 0 {
+                    return Ok(None);
+                }
+            }
+
             if !src.has_remaining() {
                 return Ok(None);
             }
@@ -331,6 +352,28 @@ impl FrameDecoder {
             if let Some(min) = self.expected {
                 if src.remaining() < min {
                     return Ok(None);
+                }
+            }
+
+            let mut header = src.cursor();
+            if let Ok(ty) = header.get_var() {
+                if self.refuse_control && frame::FrameType::is_control(ty) {
+                    return Err(FrameStreamError::Proto(FrameProtocolError::ControlFrame(
+                        ty,
+                    )));
+                }
+                // An unknown frame not kept is skipped as it arrives, never buffered whole.
+                if !self.keep_frames && frame::FrameType::is_unknown(ty) {
+                    if let Ok(len) = header.get_var() {
+                        let header_len = header.position();
+                        if self.frame_types.len() < self.record_limit {
+                            self.frame_types.push(ty);
+                        }
+                        src.advance(header_len);
+                        self.skipping = len;
+                        self.expected = None;
+                        continue;
+                    }
                 }
             }
 
@@ -467,6 +510,8 @@ pub enum FrameProtocolError {
     InvalidPushId(InvalidPushId),
     /// A kept frame of this type longer than [`MAX_KEPT_FRAME`]
     TooLarge(u64),
+    /// A frame of this type, which only a control stream carries, on a request or push stream
+    ControlFrame(u64),
     /// A HEADERS or PUSH_PROMISE frame of `size` bytes, past the `max` its stream's
     /// field sections may have (see [`FrameStream::limit_field_sections`])
     FieldSectionTooLarge {

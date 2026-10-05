@@ -8,7 +8,7 @@ use crate::ext::QpackEncoderUse;
 
 use super::{
     dynamic::{DynamicTable, DynamicTableDecoder, Error as DynamicTableError},
-    field::HeaderField,
+    field::{HeaderField, ESTIMATED_OVERHEAD_BYTES},
     static_::{Error as StaticError, StaticTable},
     vas,
 };
@@ -43,6 +43,39 @@ pub enum DecoderError {
     InvalidInsertCount(usize),
     ReferenceBeyondRequired(usize),
     CapacityTooLarge(usize),
+}
+
+/// The least size the entry of an insert instruction (its first byte `first`) cut short in
+/// `read` can have: its strings' lengths come before them, and a Huffman-coded string decodes
+/// to at least a byte per 30 bits, the longest code.
+fn least_entry_size(first: u8, read: &[u8]) -> u64 {
+    // A string's least decoded length and its length, once its prefix is read
+    fn string(size: u8, buf: &mut Cursor<&[u8]>) -> Option<(u64, u64)> {
+        let (flags, len) = prefix_int::decode(size - 1, buf).ok()?;
+        let least = match flags & 1 {
+            1 => len.saturating_mul(8) / 30,
+            _ => len,
+        };
+        Some((least, len))
+    }
+    let mut buf = Cursor::new(read);
+    let mut least = ESTIMATED_OVERHEAD_BYTES as u64;
+    match EncoderInstruction::decode(first) {
+        EncoderInstruction::InsertWithoutNameRef => {
+            if let Some((name, len)) = string(6, &mut buf) {
+                least += name;
+                if buf.remaining() as u64 >= len {
+                    buf.advance(len as usize);
+                    least += string(8, &mut buf).map_or(0, |(value, _)| value);
+                }
+            }
+        }
+        EncoderInstruction::InsertWithNameRef if prefix_int::decode(6, &mut buf).is_ok() => {
+            least += string(8, &mut buf).map_or(0, |(value, _)| value);
+        }
+        _ => {}
+    }
+    least
 }
 
 impl std::error::Error for DecoderError {}
@@ -269,6 +302,16 @@ impl Decoder {
                 None => None,
             },
         };
+
+        // An insert cut short whose announced lengths already make its entry larger than the
+        // table is refused before the rest arrives, not buffered whole to be refused then.
+        if instruction.is_none()
+            && least_entry_size(first, read.chunk()) > self.table.max_mem_size() as u64
+        {
+            return Err(DecoderError::DynamicTable(
+                DynamicTableError::MaxTableSizeReached,
+            ));
+        }
 
         if instruction.is_some() {
             let pos = buf.position();
