@@ -217,6 +217,14 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Accepts no field section past [`crate::ext::MAX_FIELD_SECTION_SIZE`]: the bound is
+    /// sent unless the SETTINGS are raw, which send what they say.
+    pub(crate) fn bound_field_section(&mut self) {
+        self.max_field_section_size = self
+            .max_field_section_size
+            .min(crate::ext::MAX_FIELD_SECTION_SIZE);
+    }
+
     /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
     /// Sets `SETTINGS_ENABLE_WEBTRANSPORT` if enabled
     pub fn enable_webtransport(&self) -> bool {

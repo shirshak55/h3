@@ -6,7 +6,7 @@ use bytes::Buf;
 
 use crate::{
     connection::ConnectionInner,
-    frame::FrameStreamError,
+    frame::{FrameProtocolError, FrameStreamError},
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming},
     shared_state::ConnectionState,
 };
@@ -199,6 +199,12 @@ where
     ) -> StreamError {
         match error {
             FrameStreamError::Quic(error) => self.handle_quic_stream_error(error),
+            FrameStreamError::Proto(FrameProtocolError::FieldSectionTooLarge { size, max }) => {
+                StreamError::HeaderTooBig {
+                    actual_size: size,
+                    max_size: max,
+                }
+            }
             FrameStreamError::Proto(frame_error) => self.handle_connection_error_on_stream(
                 InternalConnectionError::got_frame_error(frame_error).into(),
             ),

@@ -216,6 +216,7 @@ impl Builder {
         if let Some(raw) = &config.raw_settings {
             config.settings = raw.into();
         }
+        config.settings.bound_field_section();
         let max_field_section_size = config.settings.max_field_section_size;
 
         Ok(Connection {

@@ -241,6 +241,7 @@ impl Builder {
         if let Some(raw) = &config.raw_settings {
             config.settings = raw.into();
         }
+        config.settings.bound_field_section();
         config
     }
 

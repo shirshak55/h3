@@ -245,6 +245,10 @@ impl ControlFrame {
     }
 }
 
+/// The largest field section an endpoint accepts, whatever SETTINGS_MAX_FIELD_SECTION_SIZE
+/// it sends (none, or a larger one): a section is read and decoded whole.
+pub const MAX_FIELD_SECTION_SIZE: u64 = 16 << 20;
+
 /// The peer's control-stream frames after SETTINGS, as the connection reads them (see
 /// `subscribe_control_frames`). While the frames sent here and not received yet hold
 /// [`ControlFrames::BUDGET`] bytes, the connection reads no more of the control stream, so

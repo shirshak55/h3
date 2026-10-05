@@ -14,7 +14,7 @@ use crate::{
         internal_error::InternalConnectionError,
         Code, StreamError,
     },
-    frame::{FrameStream, FrameStreamError},
+    frame::{FrameProtocolError, FrameStream, FrameStreamError},
     proto::{
         frame::{Frame, PayloadLen},
         headers::Header,
@@ -131,8 +131,20 @@ where
         mut self,
         frame: Result<Option<Frame<PayloadLen>>, FrameStreamError>,
     ) -> Result<ResolvedRequest<C, B>, StreamError> {
-        let mut encoded = match frame {
-            Ok(Some(Frame::Headers(h))) => h,
+        let encoded = match frame {
+            Ok(Some(Frame::Headers(h))) => Ok(h),
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+            //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+            //# the message header it will accept on an individual HTTP message.
+            // Refused unread: answered 431 as a section decoded past the limit is, a complete
+            // response, the client told to stop sending the rest (RFC 9114 §4.1.1).
+            Err(FrameStreamError::Proto(FrameProtocolError::FieldSectionTooLarge {
+                size, ..
+            })) => {
+                self.frame_stream.stop_sending(Code::H3_NO_ERROR);
+                Err(size)
+            }
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# If a client-initiated
@@ -172,12 +184,12 @@ where
             }
         };
 
-        // With a dynamic table, the section may wait for encoder-stream instructions, so it
-        // is decoded when the request resolves.
-        let decoded = if self.qpack_end.is_some() {
-            Decoding::Pending(encoded)
-        } else {
-            Decoding::Done(
+        let decoded = match encoded {
+            Err(size) => Decoding::Done(Err(size)),
+            // With a dynamic table, the section may wait for encoder-stream instructions, so it
+            // is decoded when the request resolves.
+            Ok(encoded) if self.qpack_end.is_some() => Decoding::Pending(encoded),
+            Ok(mut encoded) => Decoding::Done(
                 match qpack::decode_stateless(&mut encoded, self.max_field_section_size) {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
                     //# An HTTP/3 implementation MAY impose a limit on the maximum size of
@@ -193,7 +205,7 @@ where
                         ));
                     }
                 },
-            )
+            ),
         };
 
         let mut request_stream = RequestStream {

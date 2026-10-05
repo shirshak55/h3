@@ -335,7 +335,7 @@ async fn header_too_big_response_from_server() {
         assert_matches!(
             err_kind,
             StreamError::HeaderTooBig {
-                actual_size: 42,
+                actual_size: 19,
                 max_size: 12
             }
         );
@@ -635,7 +635,7 @@ async fn header_too_big_discard_from_client() {
         assert_matches!(
             err.as_ref().unwrap(),
             StreamError::RemoteTerminate {
-                code: Code::H3_REQUEST_CANCELLED,
+                code: Code::H3_EXCESSIVE_LOAD,
                 ..
             }
         );
@@ -680,7 +680,7 @@ async fn header_too_big_discard_from_client_trailers() {
             assert_matches!(
                 err_kind,
                 StreamError::HeaderTooBig {
-                    actual_size: 539,
+                    actual_size: 374,
                     max_size: 200,
                     ..
                 }

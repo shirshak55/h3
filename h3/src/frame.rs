@@ -68,6 +68,12 @@ impl<S, B> FrameStream<S, B> {
         self.decoder.keep_frames = true;
     }
 
+    /// Refuses a HEADERS or PUSH_PROMISE frame longer than `max` unread
+    /// ([`FrameProtocolError::FieldSectionTooLarge`]): its field section is decoded whole.
+    pub(crate) fn limit_field_sections(&mut self, max: u64) {
+        self.decoder.max_field_section = Some(max);
+    }
+
     /// The frames kept since the last call: type, payload length and payload.
     pub(crate) fn take_frames(&mut self) -> Vec<(u64, u64, Bytes)> {
         self.decoder.kept = 0;
@@ -279,6 +285,8 @@ pub struct FrameDecoder {
     frames: Vec<(u64, u64, Bytes)>,
     /// What the frames kept hold, as a subscriber's budget counts them
     kept: usize,
+    /// The longest HEADERS or PUSH_PROMISE payload read (see [`FrameStream::limit_field_sections`])
+    max_field_section: Option<u64>,
 }
 
 impl FrameDecoder {
@@ -313,6 +321,20 @@ impl FrameDecoder {
                         || ty == frame::FrameType::WEBTRANSPORT_BI_STREAM.value();
                     if !streamed && len > MAX_KEPT_FRAME {
                         return Err(FrameStreamError::Proto(FrameProtocolError::TooLarge(ty)));
+                    }
+                }
+            }
+
+            // So is a field section: one longer than its limit is refused before it's read.
+            if let Some(max) = self.max_field_section {
+                let mut header = src.cursor();
+                if let (Ok(ty), Ok(size)) = (header.get_var(), header.get_var()) {
+                    let section = ty == frame::FrameType::HEADERS.value()
+                        || ty == frame::FrameType::PUSH_PROMISE.value();
+                    if section && size > max {
+                        return Err(FrameStreamError::Proto(
+                            FrameProtocolError::FieldSectionTooLarge { size, max },
+                        ));
                     }
                 }
             }
@@ -424,6 +446,12 @@ pub enum FrameProtocolError {
     InvalidPushId(InvalidPushId),
     /// A kept frame of this type longer than [`MAX_KEPT_FRAME`]
     TooLarge(u64),
+    /// A HEADERS or PUSH_PROMISE frame of `size` bytes, past the `max` its stream's
+    /// field sections may have (see [`FrameStream::limit_field_sections`])
+    FieldSectionTooLarge {
+        size: u64,
+        max: u64,
+    },
 }
 
 #[cfg(test)]

@@ -65,6 +65,10 @@ impl InternalConnectionError {
                     crate::frame::MAX_KEPT_FRAME
                 ),
             },
+            FrameProtocolError::FieldSectionTooLarge { size, max } => InternalConnectionError {
+                code: Code::H3_EXCESSIVE_LOAD,
+                message: format!("field section of {size} bytes longer than {max} bytes"),
+            },
             FrameProtocolError::InvalidFrameValue | FrameProtocolError::Malformed => InternalConnectionError {
                 code: Code::H3_FRAME_ERROR,
                 message: "frame payload that contains additional bytes after the identified fields or a frame payload that terminates before the end of the identified fields".to_string(),

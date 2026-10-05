@@ -159,8 +159,9 @@ where
 
     fn create_resolver_internal(
         &self,
-        stream: FrameStream<C::BidiStream, B>,
+        mut stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        stream.limit_field_sections(self.max_field_section_size);
         let qpack_end = QpackStreamEnd::track(&self.inner.shared, stream.send_id());
         RequestResolver {
             request_end: RequestEnd {

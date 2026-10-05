@@ -28,7 +28,7 @@ use crate::{
     ext::{
         ControlFrame, ControlFrames, HeaderOrder, HeldFrames, UnknownStream, WebTransportStream,
     },
-    frame::{FrameStream, FrameStreamError},
+    frame::{FrameProtocolError, FrameStream, FrameStreamError},
     proto::{
         coding::Encode,
         frame::{self, Frame, PayloadLen},
@@ -1587,11 +1587,12 @@ pub(crate) enum NextFrame {
 impl<S, B> RequestStream<S, B> {
     #[allow(missing_docs)]
     pub fn new(
-        stream: FrameStream<S, B>,
+        mut stream: FrameStream<S, B>,
         max_field_section_size: u64,
         conn_state: Arc<SharedState>,
         grease: bool,
     ) -> Self {
+        stream.limit_field_sections(max_field_section_size);
         Self {
             stream,
             conn_state,
@@ -1706,7 +1707,16 @@ where
                 }
                 Ok(frame) => return Poll::Ready(Ok(NextFrame::Frame(frame))),
                 Err(e) => {
-                    return Poll::Ready(Err(self.handle_frame_stream_error_on_request_stream(e)))
+                    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+                    //# An HTTP/3 implementation MAY impose a limit on the maximum size of
+                    //# the message header it will accept on an individual HTTP message.
+                    if let FrameStreamError::Proto(FrameProtocolError::FieldSectionTooLarge {
+                        ..
+                    }) = e
+                    {
+                        self.stream.stop_sending(Code::H3_EXCESSIVE_LOAD);
+                    }
+                    return Poll::Ready(Err(self.handle_frame_stream_error_on_request_stream(e)));
                 }
             }
         }

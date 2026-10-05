@@ -136,7 +136,7 @@ where
                 //# An HTTP/3 implementation MAY impose a limit on the maximum size of
                 //# the message header it will accept on an individual HTTP message.
                 Err(qpack::DecoderError::HeaderTooLong(cancel_size)) => {
-                    self.inner.stop_sending(Code::H3_REQUEST_CANCELLED);
+                    self.inner.stop_sending(Code::H3_EXCESSIVE_LOAD);
                     return Err(StreamError::HeaderTooBig {
                         actual_size: cancel_size,
                         max_size: self.inner.max_field_section_size,
@@ -245,7 +245,7 @@ where
         let res = self.inner.poll_recv_trailers(cx);
         if let Poll::Ready(Err(e)) = &res {
             if let StreamError::HeaderTooBig { .. } = e {
-                self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+                self.inner.stream.stop_sending(Code::H3_EXCESSIVE_LOAD);
             }
         }
         res
@@ -258,7 +258,7 @@ where
     ) -> Poll<Result<Option<(HeaderMap, crate::ext::HeaderOrder)>, StreamError>> {
         let res = self.inner.poll_recv_trailers_with_order(cx);
         if let Poll::Ready(Err(StreamError::HeaderTooBig { .. })) = &res {
-            self.inner.stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+            self.inner.stream.stop_sending(Code::H3_EXCESSIVE_LOAD);
         }
         res
     }
