@@ -181,10 +181,10 @@ impl SharedState {
     }
 
     /// Records whether the driver holds control-stream frames the transport has not taken
-    /// yet, waking the tasks waiting for them once it holds none.
+    /// yet, waking the tasks waiting for them once it holds none or starts holding some.
     pub(crate) fn set_control_in_flight(&self, in_flight: bool) {
-        self.control_in_flight.store(in_flight, Ordering::Release);
-        if !in_flight {
+        let was = self.control_in_flight.swap(in_flight, Ordering::AcqRel);
+        if !in_flight || !was {
             let wakers = std::mem::take(&mut *self.control_written_lock());
             for waker in wakers {
                 waker.wake();
@@ -197,6 +197,20 @@ impl SharedState {
     pub(crate) fn poll_control_written(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut wakers = self.control_written_lock();
         if self.control_out().is_empty() && !self.control_in_flight.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+            wakers.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+
+    /// Resolves once the control-stream frames queued so far reached the transport or wait
+    /// behind frames the transport holds back (the peer's flow control), so a frame written to
+    /// another stream after it goes out after them unless they wait for credit.
+    pub(crate) fn poll_control_flushed(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut wakers = self.control_written_lock();
+        if self.control_in_flight.load(Ordering::Acquire) || self.control_out().is_empty() {
             return Poll::Ready(());
         }
         if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {

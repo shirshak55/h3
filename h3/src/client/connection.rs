@@ -348,6 +348,14 @@ where
         future::poll_fn(|cx| self.conn_state.poll_control_written(cx)).await
     }
 
+    /// Resolves once the control-stream frames queued so far reached the transport or wait
+    /// behind frames the server's flow control holds back: a request sent after it goes out
+    /// after them unless they wait for credit, as a request a client opens while its control
+    /// stream is blocked does.
+    pub async fn control_flushed(&self) {
+        future::poll_fn(|cx| self.conn_state.poll_control_flushed(cx)).await
+    }
+
     /// Whether the server's SETTINGS enabled HTTP datagrams (RFC 9297 §2.1.1): false until
     /// they arrived.
     pub fn peer_enables_datagram(&self) -> bool {
