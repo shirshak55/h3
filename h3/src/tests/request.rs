@@ -335,7 +335,7 @@ async fn header_too_big_response_from_server() {
         assert_matches!(
             err_kind,
             StreamError::HeaderTooBig {
-                actual_size: 19,
+                actual_size: 42,
                 max_size: 12
             }
         );
@@ -680,7 +680,7 @@ async fn header_too_big_discard_from_client_trailers() {
             assert_matches!(
                 err_kind,
                 StreamError::HeaderTooBig {
-                    actual_size: 374,
+                    actual_size: 539,
                     max_size: 200,
                     ..
                 }

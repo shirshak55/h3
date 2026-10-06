@@ -81,6 +81,8 @@ where
 {
     push_id: u64,
     stream: PushStream<R, B>,
+    /// Its promised request's size, awaited until it drops (see [`SharedState::push_taken`])
+    size: usize,
     shared: Arc<SharedState>,
     max_field_section_size: u64,
 }
@@ -98,12 +100,14 @@ where
     pub(crate) fn arrived(
         push_id: u64,
         stream: FrameStream<R, B>,
+        size: usize,
         shared: Arc<SharedState>,
         max_field_section_size: u64,
     ) -> Self {
         Self {
             push_id,
             stream: PushStream::Arrived(Some(stream)),
+            size,
             shared,
             max_field_section_size,
         }
@@ -112,12 +116,14 @@ where
     pub(crate) fn awaited(
         push_id: u64,
         stream: oneshot::Receiver<FrameStream<R, B>>,
+        size: usize,
         shared: Arc<SharedState>,
         max_field_section_size: u64,
     ) -> Self {
         Self {
             push_id,
             stream: PushStream::Awaited(stream),
+            size,
             shared,
             max_field_section_size,
         }
@@ -179,6 +185,7 @@ where
     R: quic::RecvStream,
 {
     fn drop(&mut self) {
+        self.shared.push_taken(self.size);
         let stream = match &mut self.stream {
             PushStream::Arrived(stream) => stream.take(),
             // Its push stream may have arrived since it was last polled.

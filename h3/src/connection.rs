@@ -49,6 +49,10 @@ const PEER_RECORD_LIMIT: usize = 16;
 /// How many payload bytes the peer's control frames recorded may hold.
 const PEER_RECORD_BYTES: usize = 64 * 1024;
 
+/// How many bytes of frames or instructions one of our unidirectional streams may hold that
+/// the transport didn't take
+const STREAM_BACKLOG: usize = 1 << 20;
+
 #[allow(missing_docs)]
 pub struct AcceptedStreams<C, B>
 where
@@ -805,21 +809,29 @@ where
                     push_id,
                     stream,
                     request,
+                    size,
                 } => {
-                    if self.cancelled_pushes.remove(&push_id) {
-                        self.cancel_pairing(push_id, false);
-                        continue;
-                    }
                     let Some(tx) = &self.pushes_tx else {
                         // No receiver: cancelled as a client that delivers none cancels it.
+                        self.shared.push_taken(size);
                         self.cancel_pairing(push_id, true);
                         continue;
                     };
                     let max_field_section_size = self.config.settings.max_field_section_size;
                     let response = match self.pushes.remove(&push_id) {
+                        // Cancelled by the server before it was delivered: its response
+                        // fails as one cancelled after, its promise delivered in band paired.
+                        _ if self.cancelled_pushes.remove(&push_id) => PushedResponse::awaited(
+                            push_id,
+                            oneshot::channel().1,
+                            size,
+                            self.shared.clone(),
+                            max_field_section_size,
+                        ),
                         Some(PushPairing::Stream(stream)) => PushedResponse::arrived(
                             push_id,
                             stream,
+                            size,
                             self.shared.clone(),
                             max_field_section_size,
                         ),
@@ -829,6 +841,7 @@ where
                             PushedResponse::awaited(
                                 push_id,
                                 awaited,
+                                size,
                                 self.shared.clone(),
                                 max_field_section_size,
                             )
@@ -928,8 +941,9 @@ where
         cx: &mut Context<'_>,
     ) -> Result<(), ConnectionError> {
         while let Poll::Ready(stream) = self.poll_accept_bi(cx) {
-            self.webtransport_bidi
-                .push(FrameStream::new(BufRecvStream::new(stream?)));
+            let mut stream = FrameStream::new(BufRecvStream::new(stream?));
+            stream.expect_webtransport_signal();
+            self.webtransport_bidi.push(stream);
         }
         let mut index = 0;
         while index < self.webtransport_bidi.len() {
@@ -1268,7 +1282,7 @@ where
         };
         match self.decoder_queue.poll_write(stream, cx) {
             Poll::Ready(Err(e)) => Err(self.critical_stream_error(e, "QPACK decoder")),
-            _ => Ok(()),
+            _ => self.backlog(self.decoder_queue.data.len(), "QPACK decoder"),
         }
     }
 
@@ -1323,8 +1337,21 @@ where
         };
         match self.encoder_queue.poll_write(stream, cx) {
             Poll::Ready(Err(e)) => Err(self.critical_stream_error(e, "QPACK encoder")),
-            _ => Ok(()),
+            _ => self.backlog(self.encoder_queue.data.len(), "QPACK encoder"),
         }
+    }
+
+    /// Fails the connection once `held` bytes wait to be written on our `stream` past
+    /// [`STREAM_BACKLOG`]: the peer's flow control holds the stream back while it keeps causing
+    /// more.
+    fn backlog(&mut self, held: usize, stream: &str) -> Result<(), ConnectionError> {
+        if held <= STREAM_BACKLOG {
+            return Ok(());
+        }
+        Err(self.handle_connection_error(InternalConnectionError::new(
+            Code::H3_EXCESSIVE_LOAD,
+            format!("the {stream} stream holds {held} bytes the peer's flow control didn't take"),
+        )))
     }
 
     /// Writes the control-stream frames streams queued. Those queued while the transport
@@ -1349,7 +1376,8 @@ where
                 Poll::Ready(Ok(())) => {}
                 Poll::Pending => {
                     self.shared.set_control_in_flight(true);
-                    return Ok(());
+                    let held = self.control_queue.data.len() + self.shared.control_out().len();
+                    return self.backlog(held, "control");
                 }
             }
         }

@@ -71,8 +71,10 @@ impl<S, B> FrameStream<S, B> {
         self.decoder.keep_frames = true;
     }
 
-    /// Refuses a HEADERS or PUSH_PROMISE frame longer than `max` unread
-    /// ([`FrameProtocolError::FieldSectionTooLarge`]): its field section is decoded whole.
+    /// Refuses unread a HEADERS or PUSH_PROMISE frame longer than a field section of `max`
+    /// bytes encodes to ([`FrameProtocolError::FieldSectionTooLarge`]), its section being
+    /// buffered whole; `max` itself, a decoded size (RFC 9114 §4.2.2), is enforced as the
+    /// section is decoded.
     pub(crate) fn limit_field_sections(&mut self, max: u64) {
         self.decoder.max_field_section = Some(max);
     }
@@ -81,6 +83,12 @@ impl<S, B> FrameStream<S, B> {
     /// ([`FrameProtocolError::ControlFrame`]): a request or push stream carries none.
     pub(crate) fn refuse_control_frames(&mut self) {
         self.decoder.refuse_control = true;
+    }
+
+    /// Refuses a stream not starting with the WEBTRANSPORT_STREAM signal as soon as its type
+    /// is read ([`FrameProtocolError::ForbiddenFrame`]): no length or payload is awaited.
+    pub(crate) fn expect_webtransport_signal(&mut self) {
+        self.decoder.webtransport_signal = true;
     }
 
     /// The frames kept since the last call: type, payload length and payload.
@@ -312,10 +320,13 @@ pub struct FrameDecoder {
     frames: Vec<(u64, u64, Bytes)>,
     /// What the frames kept hold, as a subscriber's budget counts them
     kept: usize,
-    /// The longest HEADERS or PUSH_PROMISE payload read (see [`FrameStream::limit_field_sections`])
+    /// The largest field section a HEADERS or PUSH_PROMISE frame may carry (see
+    /// [`FrameStream::limit_field_sections`])
     max_field_section: Option<u64>,
     /// See [`FrameStream::refuse_control_frames`]
     refuse_control: bool,
+    /// See [`FrameStream::expect_webtransport_signal`]
+    webtransport_signal: bool,
     /// What is left of the unknown frame being skipped
     skipping: u64,
 }
@@ -357,6 +368,13 @@ impl FrameDecoder {
 
             let mut header = src.cursor();
             if let Ok(ty) = header.get_var() {
+                if self.webtransport_signal
+                    && ty != frame::FrameType::WEBTRANSPORT_BI_STREAM.value()
+                {
+                    return Err(FrameStreamError::Proto(FrameProtocolError::ForbiddenFrame(
+                        ty,
+                    )));
+                }
                 if self.refuse_control && frame::FrameType::is_control(ty) {
                     return Err(FrameStreamError::Proto(FrameProtocolError::ControlFrame(
                         ty,
@@ -389,13 +407,21 @@ impl FrameDecoder {
                 }
             }
 
-            // So is a field section: one longer than its limit is refused before it's read.
+            // So is a field section: one longer than its limit allows encoded is refused
+            // before it's read. A field line's decoded size is its name and value plus 32, and
+            // each byte Huffman-codes to at most 30 bits: encoded with its prefixes (and a push
+            // ID), a section is at most four times its size plus 64 bytes, never buffered past
+            // `ext::MAX_FIELD_SECTION_SIZE`.
             if let Some(max) = self.max_field_section {
+                let encoded = max
+                    .saturating_mul(4)
+                    .saturating_add(64)
+                    .min(crate::ext::MAX_FIELD_SECTION_SIZE);
                 let mut header = src.cursor();
                 if let (Ok(ty), Ok(size)) = (header.get_var(), header.get_var()) {
                     let section = ty == frame::FrameType::HEADERS.value()
                         || ty == frame::FrameType::PUSH_PROMISE.value();
-                    if section && size > max {
+                    if section && size > encoded {
                         return Err(FrameStreamError::Proto(
                             FrameProtocolError::FieldSectionTooLarge { size, max },
                         ));
@@ -512,8 +538,8 @@ pub enum FrameProtocolError {
     TooLarge(u64),
     /// A frame of this type, which only a control stream carries, on a request or push stream
     ControlFrame(u64),
-    /// A HEADERS or PUSH_PROMISE frame of `size` bytes, past the `max` its stream's
-    /// field sections may have (see [`FrameStream::limit_field_sections`])
+    /// A HEADERS or PUSH_PROMISE frame of `size` bytes, longer than a field section of the
+    /// `max` its stream's may have encodes to (see [`FrameStream::limit_field_sections`])
     FieldSectionTooLarge {
         size: u64,
         max: u64,

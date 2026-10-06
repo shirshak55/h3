@@ -35,6 +35,12 @@ const NO_MAX_PUSH_ID: u64 = u64::MAX;
 /// holds aside) a frame sent through [`SharedState::send_raw_control_frame`] may queue past
 const CONTROL_BACKLOG: usize = 64 * 1024;
 
+/// How many pushes delivered to this client may await their push streams at once, and how
+/// many bytes their promised requests' field sections may total (RFC 9114 §4.2.2 sizes):
+/// past either, the server's next promise is H3_EXCESSIVE_LOAD
+const MAX_AWAITED_PUSHES: usize = 1024;
+const MAX_AWAITED_PUSH_BYTES: usize = crate::ext::MAX_FIELD_SECTION_SIZE as usize;
+
 #[derive(Debug)]
 /// This struct represents the shared state of the h3 connection and the stream structs
 pub struct SharedState {
@@ -74,6 +80,10 @@ struct Pushes {
     ids: HashMap<u64, PushSeen>,
     /// What the request streams hand the connection driver
     pending: Vec<PushPending>,
+    /// The pushes delivered whose push streams weren't taken yet, and their promised
+    /// requests' sizes (see [`MAX_AWAITED_PUSHES`])
+    awaited: usize,
+    awaited_bytes: usize,
 }
 
 /// How a push ID was seen
@@ -91,11 +101,13 @@ struct PushSeen {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PushPending {
-    /// A PUSH_PROMISE decoded on the request stream `stream`
+    /// A PUSH_PROMISE decoded on the request stream `stream`, its promised request `size`
+    /// bytes, awaited until released ([`SharedState::push_taken`])
     Promised {
         push_id: u64,
         stream: StreamId,
         request: http::Request<()>,
+        size: usize,
     },
     /// A promise that can't be delivered (its request is malformed): its push stream, if it
     /// arrived, is stopped
@@ -383,17 +395,37 @@ impl SharedState {
             }
             return Ok(None);
         }
+        let size = fields
+            .iter()
+            .map(|field| field.name.len() + field.value.len() + 32)
+            .sum::<usize>();
         let (pending, in_band) = match promised_request(fields.clone())
             .and_then(|request| promised_request(fields).map(|in_band| (request, in_band)))
         {
-            Ok((request, in_band)) => (
-                PushPending::Promised {
-                    push_id,
-                    stream,
-                    request,
-                },
-                Some(in_band),
-            ),
+            Ok((request, in_band)) => {
+                if pushes.awaited >= MAX_AWAITED_PUSHES
+                    || pushes.awaited_bytes + size > MAX_AWAITED_PUSH_BYTES
+                {
+                    return Err(InternalConnectionError::new(
+                        Code::H3_EXCESSIVE_LOAD,
+                        format!(
+                            "PUSH_PROMISE past the {} pushes ({} bytes of promised requests) awaiting their push streams",
+                            pushes.awaited, pushes.awaited_bytes
+                        ),
+                    ));
+                }
+                pushes.awaited += 1;
+                pushes.awaited_bytes += size;
+                (
+                    PushPending::Promised {
+                        push_id,
+                        stream,
+                        request,
+                        size,
+                    },
+                    Some(in_band),
+                )
+            }
             Err(_) => {
                 if !streamed {
                     self.send_control_frame(&ControlFrame::CancelPush(push_id));
@@ -404,6 +436,14 @@ impl SharedState {
         pushes.pending.push(pending);
         self.waker.wake();
         Ok(in_band)
+    }
+
+    /// Releases a push delivered with a promised request of `size` bytes: its push stream was
+    /// taken, or it was cancelled.
+    pub(crate) fn push_taken(&self, size: usize) {
+        let mut pushes = self.pushes_lock();
+        pushes.awaited -= 1;
+        pushes.awaited_bytes -= size;
     }
 
     /// Tells the connection driver the request stream `stream` promises no more pushes.
