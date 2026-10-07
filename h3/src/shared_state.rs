@@ -2,8 +2,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
-    hash::{DefaultHasher, Hash, Hasher},
+    collections::{hash_map::Entry, HashMap},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
@@ -14,6 +13,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use futures_util::task::AtomicWaker;
 use http::HeaderName;
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::Settings,
@@ -40,6 +40,11 @@ const CONTROL_BACKLOG: usize = 64 * 1024;
 /// past either, the server's next promise is H3_EXCESSIVE_LOAD
 const MAX_AWAITED_PUSHES: usize = 1024;
 const MAX_AWAITED_PUSH_BYTES: usize = crate::ext::MAX_FIELD_SECTION_SIZE as usize;
+
+/// How many push IDs a client records (promised, pushed or cancelled) for a connection's
+/// life, as many as the streams it allows: past it, the server's next new one is
+/// H3_EXCESSIVE_LOAD
+const MAX_PUSH_IDS: usize = 1 << 18;
 
 #[derive(Debug)]
 /// This struct represents the shared state of the h3 connection and the stream structs
@@ -89,12 +94,27 @@ struct Pushes {
 /// How a push ID was seen
 #[derive(Debug, Default)]
 struct PushSeen {
-    /// The hash of the promised request's field lines
-    promise: Option<u64>,
+    /// The SHA-256 digest of the promised request's field lines
+    promise: Option<[u8; 32]>,
     /// Its push stream arrived
     streamed: bool,
     /// This client sent CANCEL_PUSH for it
     cancelled: bool,
+}
+
+impl Pushes {
+    /// The record of `push_id`, made if it is new unless [`MAX_PUSH_IDS`] are recorded
+    fn seen(&mut self, push_id: u64) -> Result<&mut PushSeen, InternalConnectionError> {
+        let full = self.ids.len() >= MAX_PUSH_IDS;
+        match self.ids.entry(push_id) {
+            Entry::Occupied(seen) => Ok(seen.into_mut()),
+            Entry::Vacant(_) if full => Err(InternalConnectionError::new(
+                Code::H3_EXCESSIVE_LOAD,
+                format!("push ID {push_id} past the {MAX_PUSH_IDS} push IDs recorded"),
+            )),
+            Entry::Vacant(seen) => Ok(seen.insert(PushSeen::default())),
+        }
+    }
 }
 
 /// What a request stream hands the connection driver about pushes
@@ -298,21 +318,26 @@ impl SharedState {
     }
 
     /// Records the push stream `stream` for `push_id`: whether it is the first for that ID.
-    pub(crate) fn push_stream(&self, push_id: u64, stream: StreamId) -> bool {
+    pub(crate) fn push_stream(
+        &self,
+        push_id: u64,
+        stream: StreamId,
+    ) -> Result<bool, InternalConnectionError> {
         let mut pushes = self.pushes_lock();
-        let first = !std::mem::replace(&mut pushes.ids.entry(push_id).or_default().streamed, true);
+        let first = !std::mem::replace(&mut pushes.seen(push_id)?.streamed, true);
         if pushes.events.len() < 16 {
             pushes.events.push(PushEvent::Stream { push_id, stream });
         }
-        first
+        Ok(first)
     }
 
-    /// Queues CANCEL_PUSH for `push_id` unless this client sent one already.
+    /// Queues CANCEL_PUSH for `push_id` unless this client sent one already (one past the
+    /// push IDs recorded is sent unrecorded: the server's promise or push stream for it fails).
     pub(crate) fn cancel_push(&self, push_id: u64) {
-        let first = !std::mem::replace(
-            &mut self.pushes_lock().ids.entry(push_id).or_default().cancelled,
-            true,
-        );
+        let first = self
+            .pushes_lock()
+            .seen(push_id)
+            .map_or(true, |seen| !std::mem::replace(&mut seen.cancelled, true));
         if first {
             self.send_control_frame(&ControlFrame::CancelPush(push_id));
         }
@@ -346,19 +371,21 @@ impl SharedState {
                 format!("PUSH_PROMISE with push ID {push_id} above MAX_PUSH_ID"),
             ));
         }
-        let mut hasher = DefaultHasher::new();
+        let mut digest = Sha256::new();
         for field in &fields {
-            field.name.as_ref().hash(&mut hasher);
-            field.value.as_ref().hash(&mut hasher);
+            for part in [field.name.as_ref(), field.value.as_ref()] {
+                digest.update(part.len().to_be_bytes());
+                digest.update(part);
+            }
         }
-        let hash = hasher.finish();
+        let hash: [u8; 32] = digest.finalize().into();
         let mut pushes = self.pushes_lock();
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
         //# If a client
         //# receives a push ID that has already been promised and detects a
         //# mismatch, it MUST respond with a connection error of type
         //# H3_GENERAL_PROTOCOL_ERROR.
-        let seen = pushes.ids.entry(push_id).or_default();
+        let seen = pushes.seen(push_id)?;
         let previous = seen.promise.replace(hash);
         let streamed = seen.streamed;
         if previous.is_some_and(|earlier| earlier != hash) {

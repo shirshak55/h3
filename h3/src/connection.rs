@@ -674,7 +674,9 @@ where
                     let id = stream.id();
                     stream.stop_sending(Code::H3_REQUEST_CANCELLED);
                     self.shared.qpack().cancel_stream(id.into_inner());
-                    self.shared.push_stream(push_id, id);
+                    if let Err(error) = self.shared.push_stream(push_id, id) {
+                        return Err(self.handle_connection_error(error));
+                    }
                 }
                 // A stream no one receives any more is dropped, which stops it.
                 AcceptedRecvStream::WebTransportUni(id, s) if self.webtransport_tx.is_some() => {
@@ -767,11 +769,15 @@ where
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
         //# If a push stream header includes a push ID that was used in another push stream
         //# header, the client MUST treat this as a connection error of type H3_ID_ERROR.
-        if !self.shared.push_stream(push_id, id) {
-            return Err(self.handle_connection_error(InternalConnectionError::new(
-                Code::H3_ID_ERROR,
-                format!("push stream {id} repeats push ID {push_id}"),
-            )));
+        match self.shared.push_stream(push_id, id) {
+            Ok(true) => (),
+            Ok(false) => {
+                return Err(self.handle_connection_error(InternalConnectionError::new(
+                    Code::H3_ID_ERROR,
+                    format!("push stream {id} repeats push ID {push_id}"),
+                )))
+            }
+            Err(error) => return Err(self.handle_connection_error(error)),
         }
         // The server cancelled the push before its promise arrived, or this client cancelled
         // it.
