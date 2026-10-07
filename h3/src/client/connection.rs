@@ -24,7 +24,7 @@ use crate::{
     proto::{frame::Frame, headers::Header, push::PushId},
     quic::{self, SendStream as _, StreamId},
     shared_state::{ConnectionState, PushEnd, QpackStreamEnd, SharedState},
-    stream::{self, BufRecvStream},
+    stream::BufRecvStream,
 };
 
 use super::{push::PushDelivery, stream::RequestStream};
@@ -150,6 +150,20 @@ where
         &mut self,
         req: http::Request<()>,
     ) -> Result<RequestStream<T::BidiStream, B>, StreamError> {
+        let mut stream = self.queue_request(req).await?;
+        stream.flush().await?;
+        Ok(stream)
+    }
+
+    /// [`Self::send_request`] without waiting for the request's HEADERS to be written: the
+    /// stream opens with them queued, for [`RequestStream::flush`] to write before anything
+    /// else is sent or the stream finished. A request whose HEADERS wait for the server's flow
+    /// control then holds back none sent after it, and can be reset meanwhile
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn queue_request(
+        &mut self,
+        req: http::Request<()>,
+    ) -> Result<RequestStream<T::BidiStream, B>, StreamError> {
         if !self.after_goaway {
             if let Some(error) = self.check_peer_connection_closing() {
                 return Err(error);
@@ -230,8 +244,8 @@ where
             });
         }
 
-        stream::write(&mut stream, Frame::Headers(block.freeze()))
-            .await
+        stream
+            .send_data(Frame::Headers(block.freeze()))
             .map_err(|e| self.handle_quic_stream_error(e))?;
 
         let qpack_end = QpackStreamEnd::track(&self.conn_state, stream.send_id());

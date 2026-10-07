@@ -1999,6 +1999,14 @@ where
     S: quic::SendStream<B>,
     B: Buf,
 {
+    /// Writes what is queued on the stream (see `client::SendRequest::queue_request`).
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn flush(&mut self) -> Result<(), StreamError> {
+        future::poll_fn(|cx| self.stream.poll_ready(cx))
+            .await
+            .map_err(|e| self.handle_quic_stream_error(e))
+    }
+
     /// Send some data on the response body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {

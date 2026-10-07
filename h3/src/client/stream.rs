@@ -311,6 +311,12 @@ where
     S: quic::SendStream<B>,
     B: Buf,
 {
+    /// Writes the HEADERS [`super::SendRequest::queue_request`] queued, if not written yet.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub async fn flush(&mut self) -> Result<(), StreamError> {
+        self.inner.flush().await
+    }
+
     /// Send some data on the request body.
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub async fn send_data(&mut self, buf: B) -> Result<(), StreamError> {
