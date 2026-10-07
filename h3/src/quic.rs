@@ -235,6 +235,14 @@ pub trait RecvStream {
         error_code: u64,
     ) -> Poll<Result<Option<u64>, StreamErrorIncoming>>;
 
+    /// Poll for the peer resetting the stream (RESET_STREAM), reading none of its data: `Some`
+    /// with its code, `None` once it can't be reset any more (all of it was read, or it was
+    /// stopped). A RESET_STREAM_AT's comes as a read error once its reliable part was read.
+    fn poll_received_reset(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>>;
+
     /// Get QUIC send stream id
     fn recv_id(&self) -> StreamId;
 }

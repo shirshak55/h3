@@ -625,11 +625,13 @@ where
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
                 //# The CANCEL_PUSH frame (type=0x03) is used to request cancellation of
                 //# a server push prior to the push stream being received.
-                Ok(Frame::CancelPush(push_id)) if self.inner.shared.accepts_pushes() => {
+                Ok(Frame::CancelPush(push_id)) => {
+                    if let Err(error) = self.inner.push_cancelled(push_id.0) {
+                        return Poll::Ready(self.inner.handle_connection_error(error));
+                    }
                     self.inner
                         .shared
                         .record_push(crate::ext::PushEvent::Cancelled { push_id: push_id.0 });
-                    self.inner.push_cancelled(push_id.0);
                 }
 
                 Ok(Frame::Goaway(id)) => {

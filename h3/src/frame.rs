@@ -226,6 +226,15 @@ where
         self.stream.poll_stop_and_await_end(cx, error_code.into())
     }
 
+    /// Polls for the peer resetting the underlying stream (see
+    /// [`RecvStream::poll_received_reset`])
+    pub(crate) fn poll_received_reset(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.stream.poll_received_reset(cx)
+    }
+
     pub(crate) fn has_data(&self) -> bool {
         self.unbounded || self.remaining_data != 0
     }
@@ -855,6 +864,13 @@ mod tests {
             &mut self,
             _: &mut Context<'_>,
             _: u64,
+        ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+            unimplemented!()
+        }
+
+        fn poll_received_reset(
+            &mut self,
+            _: &mut Context<'_>,
         ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
             unimplemented!()
         }

@@ -81,7 +81,7 @@ pub struct SharedState {
 struct Pushes {
     /// The first events seen
     events: Vec<PushEvent>,
-    /// Each push ID promised or pushed
+    /// Each push ID promised, pushed or cancelled
     ids: HashMap<u64, PushSeen>,
     /// What the request streams hand the connection driver
     pending: Vec<PushPending>,
@@ -100,6 +100,8 @@ struct PushSeen {
     streamed: bool,
     /// This client sent CANCEL_PUSH for it
     cancelled: bool,
+    /// The server sent CANCEL_PUSH for it before its promise or push stream was handled
+    server_cancelled: bool,
 }
 
 impl Pushes {
@@ -349,6 +351,22 @@ impl SharedState {
             .ids
             .get(&push_id)
             .is_some_and(|seen| seen.cancelled)
+    }
+
+    /// Records the server's CANCEL_PUSH for `push_id`, whose promise or push stream wasn't
+    /// handled yet (see [`Self::take_server_cancelled`]).
+    pub(crate) fn server_cancelled(&self, push_id: u64) -> Result<(), InternalConnectionError> {
+        self.pushes_lock().seen(push_id)?.server_cancelled = true;
+        Ok(())
+    }
+
+    /// Whether the server cancelled `push_id` before its promise or push stream was handled,
+    /// which this forgets.
+    pub(crate) fn take_server_cancelled(&self, push_id: u64) -> bool {
+        self.pushes_lock()
+            .ids
+            .get_mut(&push_id)
+            .is_some_and(|seen| std::mem::take(&mut seen.server_cancelled))
     }
 
     /// A PUSH_PROMISE decoded on the request stream `stream`, checked against MAX_PUSH_ID and

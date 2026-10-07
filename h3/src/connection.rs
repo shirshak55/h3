@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     convert::TryFrom,
     marker::PhantomData,
     sync::Arc,
@@ -158,8 +158,6 @@ where
     control_queue: Queued,
     /// The server's pushes being paired, by push ID
     pushes: HashMap<u64, PushPairing<C::RecvStream, B>>,
-    /// The push IDs the server cancelled before their promise arrived
-    cancelled_pushes: HashSet<u64>,
     /// Delivers the pushes paired
     pushes_tx: Option<mpsc::UnboundedSender<PushDelivery<C::RecvStream, B>>>,
     /// SETTINGS and the rest written on the unidirectional streams are held back until
@@ -413,7 +411,6 @@ where
             encoder_typed: !config.qpack_lazy_stream_types,
             control_queue: Queued::default(),
             pushes: HashMap::new(),
-            cancelled_pushes: HashSet::new(),
             pushes_tx: None,
             deferred: config.defer_settings,
             send_grease_frame: config.send_grease_frame,
@@ -781,7 +778,7 @@ where
         }
         // The server cancelled the push before its promise arrived, or this client cancelled
         // it.
-        if self.cancelled_pushes.remove(&push_id) || self.shared.push_cancelled(push_id) {
+        if self.shared.take_server_cancelled(push_id) || self.shared.push_cancelled(push_id) {
             self.stop_push_stream(stream);
             return Ok(());
         }
@@ -827,7 +824,7 @@ where
                     let response = match self.pushes.remove(&push_id) {
                         // Cancelled by the server before it was delivered: its response
                         // fails as one cancelled after, its promise delivered in band paired.
-                        _ if self.cancelled_pushes.remove(&push_id) => PushedResponse::awaited(
+                        _ if self.shared.take_server_cancelled(push_id) => PushedResponse::awaited(
                             push_id,
                             oneshot::channel().1,
                             size,
@@ -892,14 +889,24 @@ where
 
     /// The server cancelled `push_id` (CANCEL_PUSH): its response, if delivered, fails; its
     /// push stream, if it arrived, is stopped.
-    pub(crate) fn push_cancelled(&mut self, push_id: u64) {
+    pub(crate) fn push_cancelled(&mut self, push_id: u64) -> Result<(), InternalConnectionError> {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+        //# If a CANCEL_PUSH frame is received that
+        //# references a push ID greater than currently allowed on the
+        //# connection, this MUST be treated as a connection error of type
+        //# H3_ID_ERROR.
+        if self.shared.max_push_id().map_or(true, |max| push_id > max) {
+            return Err(InternalConnectionError::new(
+                Code::H3_ID_ERROR,
+                format!("CANCEL_PUSH with push ID {push_id} above MAX_PUSH_ID"),
+            ));
+        }
         match self.pushes.remove(&push_id) {
             Some(PushPairing::Promised(_)) => (),
             Some(PushPairing::Stream(stream)) => self.stop_push_stream(stream),
-            None => {
-                self.cancelled_pushes.insert(push_id);
-            }
+            None => self.shared.server_cancelled(push_id)?,
         }
+        Ok(())
     }
 
     /// Receives the server's pushes as they are promised, when this client delivers them

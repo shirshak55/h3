@@ -143,6 +143,22 @@ where
             })
     }
 
+    /// Poll for the client resetting the request stream (RESET_STREAM), reading none of it:
+    /// `Some` with its code, `None` once it can't be reset any more. A relay waiting to send
+    /// what it read learns of the reset it then passes on. A RESET_STREAM_AT's comes from
+    /// [`Self::poll_recv_data`] once its reliable part was read.
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    pub fn poll_received_reset(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Code>, StreamError>> {
+        self.inner.stream.poll_received_reset(cx).map(|reset| {
+            reset
+                .map(|code| code.map(Code::from))
+                .map_err(|error| self.handle_quic_stream_error(error))
+        })
+    }
+
     /// Returns the underlying stream id
     pub fn id(&self) -> StreamId {
         self.inner.stream.id()

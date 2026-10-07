@@ -391,6 +391,13 @@ impl<B: Buf> quic::RecvStream for BidiStream<B> {
         self.recv.poll_stop_and_await_end(cx, error_code)
     }
 
+    fn poll_received_reset(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        self.recv.poll_received_reset(cx)
+    }
+
     fn recv_id(&self) -> StreamId {
         self.recv.recv_id()
     }
@@ -496,14 +503,20 @@ impl quic::RecvStream for RecvStream {
         Poll::Ready(
             ended
                 .map(|code| code.map(VarInt::into_inner))
-                .map_err(|error| match error {
-                    quinn::ResetError::ConnectionLost(connection_error) => {
-                        StreamErrorIncoming::ConnectionErrorIncoming {
-                            connection_error: convert_connection_error(connection_error),
-                        }
-                    }
-                    error @ quinn::ResetError::ZeroRttRejected => zero_rtt_rejected(error),
-                }),
+                .map_err(convert_reset_error),
+        )
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
+    fn poll_received_reset(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<Option<u64>, StreamErrorIncoming>> {
+        let reset = ready!(std::pin::pin!(self.stream.received_reset()).poll(cx));
+        Poll::Ready(
+            reset
+                .map(|code| code.map(VarInt::into_inner))
+                .map_err(convert_reset_error),
         )
     }
 
@@ -536,6 +549,17 @@ fn convert_read_error_to_stream_error(error: ReadError) -> StreamErrorIncoming {
         error @ ReadError::ClosedStream => StreamErrorIncoming::Unknown(Box::new(error)),
         ReadError::IllegalOrderedRead => panic!("h3-quinn only performs ordered reads"),
         error @ ReadError::ZeroRttRejected => zero_rtt_rejected(error),
+    }
+}
+
+fn convert_reset_error(error: quinn::ResetError) -> StreamErrorIncoming {
+    match error {
+        quinn::ResetError::ConnectionLost(connection_error) => {
+            StreamErrorIncoming::ConnectionErrorIncoming {
+                connection_error: convert_connection_error(connection_error),
+            }
+        }
+        error @ quinn::ResetError::ZeroRttRejected => zero_rtt_rejected(error),
     }
 }
 
